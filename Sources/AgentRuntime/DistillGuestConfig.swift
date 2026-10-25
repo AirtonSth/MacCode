@@ -54,6 +54,7 @@ public enum DistillGuestConfig {
         ),
         GatewayServer(name: BotComputerCatalog.serverName, toolTimeoutSeconds: 900),
         GatewayServer(name: BotWebCatalog.serverName, toolTimeoutSeconds: 900),
+        GatewayServer(name: ConnectionMCPCatalog.serverName, toolTimeoutSeconds: 60),
     ]
 
     public static func gatewayURL(port: UInt16, server: String) -> String {

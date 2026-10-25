@@ -334,7 +334,12 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
             ),
         ]
         let isBotRun = BotRunMCPAdmission.isBotRun(environment: environment)
-        return servers
+        // Only variable names enter argv; Codex inherits their values from its exact run environment.
+        let inheritedKeys = ConnectionsMCPAdmit.environment(environment).keys.sorted()
+            .map { "\"\(tomlBasicString($0))\"" }.joined(separator: ",")
+        let connectionOverrides = stdioMCPServerOverrides(serverName: ConnectionMCPCatalog.serverName, cliArgument: ConnectionMCPCatalog.cliArgument, command: resolved)
+            + ["-c", "mcp_servers.\(ConnectionMCPCatalog.serverName).env_vars=[\(inheritedKeys)]"]
+        return connectionOverrides + servers
             .filter { isBotRun || !BotRunMCPAdmission.botOnlyServerNames.contains($0.name) }
             .flatMap {
                 stdioMCPServerOverrides(
@@ -375,10 +380,9 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         if let toolTimeoutSeconds {
             overrides += ["-c", "\(prefix).tool_timeout_sec=\(toolTimeoutSeconds)"]
         }
-        for (key, value) in environment.sorted(by: { $0.key < $1.key }) {
-            overrides += [
-                "-c", "\(prefix).env.\(key)=\"\(tomlBasicString(value))\"",
-            ]
+        if !environment.isEmpty {
+            let names = environment.keys.sorted().map { "\"\(tomlBasicString($0))\"" }.joined(separator: ",")
+            overrides += ["-c", "\(prefix).env_vars=[\(names)]"]
         }
         return overrides
     }

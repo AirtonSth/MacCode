@@ -1,6 +1,6 @@
 # MacCode: teams, workspace links, connections and a clean chat
 
-Status: concrete proposal for review; no product implementation yet.
+Status: approved 2026-10-24; user explicitly chose exclusive airtours ownership and authorized implementation, testing, review and push for all four points.
 Base: AirtonSth/MacCode commit 285ab2c9. Reference: OpenMausBot UI inspected
 on the user's Mac on 2026-10-24 and the user's MacCode screenshot.
 
@@ -42,35 +42,9 @@ search, current associations and an Add existing action. Offer the same action
 from each resource's context menu. Do not clone a bot, create a VM or rebuild a
 container merely to organize it.
 
-**Proposed default (builder's call): association is not exclusive ownership.**
-For the requested setup, associate existing Tech Lead, QA and Engineer with the
-existing airtours workspace using canonical context grants. Skip already-active
-unchanged grants; do not increment policy revisions unnecessarily. Existing
-conversation pins, bot IDs, histories, skills, schedules and destinations stay
-unchanged. Show the scope/access explicitly in the manager.
+**Approved policy: exclusive workspace ownership.** The owner selected “Tornar exclusivos do airtours”. Add explicit transactional ownership-transfer operations for existing bots and VMs. Preserve IDs, histories, skills, schedules, VM UUID/storage/files and existing immutable conversation pins. Use compare-and-set revision/source-scope checks; do not silently rewrite thread or schedule destinations. Grant the destination context through the canonical authority path only when needed. Reject a transfer that would invalidate other bots, historical thread destinations or schedule overrides, explaining affected records. Coordinate with VM resource maintenance claims so starts/running/queued/user-controlled work cannot race a scope move. Do not silently stop or redirect unrelated work. Existing additional grants require explicit coherent policy handling; exclusivity is not merely sidebar grouping.
 
-For the existing general VM airtours, add a durable workspace association
-separate from immutable VM ownership, retaining UUID, Docker storage namespace,
-files, applications and browser sessions. General shared machines remain marked
-Shared; linking them must not imply that data is isolated from previous users.
-Do not weaken BotVirtualMachine.allows or reinterpret an ownership field just
-to display a sidebar row. Existing exclusive workspace VMs retain their access
-rules; incompatible links are refused with an explanation.
-
-Use one canonical host/store operation per association with revision/conflict
-checks, events and readback. Unlinking removes that association rather than the
-resource. Context revocation follows the existing cancellation/revocation path;
-a running task is not silently moved or given another runtime. Changing bot or
-VM exclusive ownership is a distinct future operation, not implicit in linking.
-The association catalog itself does not mount another directory, start a VM,
-change a bot's execution destination or grant a connection to a bot.
-
-Apply the named airtours associations only after the new behavior is tested,
-resolving exact IDs and checking current associations first. No name-only writes.
-
-Existing constraints: BotDefinition.workspaceID is exclusive legacy ownership;
-context grants are different. saveVirtualMachine currently rejects ownership
-changes. A dedicated additive association store avoids corrupting these rules.
+Add workspace “Attach existing bots…” and “Attach existing VM…” actions and resource “Move to workspace…” controls. These are existing-only selections, not resource duplication or rebuild. After isolated verification, resolve exact IDs and attach the named Tech Lead/QA/Engineer and airtours VM to airtours using the canonical operations. Remove the earlier non-exclusive association proposal; no cosmetic association table is needed for this approved delivery.
 
 ## 3. Connections owned by MacCode
 
@@ -100,10 +74,7 @@ shared developer key requires a backend; no shared key embedded in the app.
 Persist stable user/account IDs and scoped sessions, handle expiration, and never
 blindly retry a service write after an ambiguous response.
 
-This request asks to find an approach: first deliver the validated integration
-design and catalog/gateway plan; do not purchase a service, create external apps,
-or claim a live Composio connection before credentials and real calls are tested.
-Generic MCP and the Composio adapter can then be implemented as separate slices.
+The owner now requires all four points implemented and tested. Deliver working generic MCP management and provider-independent admission in this change, with real fixture tools/list and tools/call verification. Support Composio as a hosted MCP connection without requiring it as the only backend. Do not purchase services, create external apps or claim third-party OAuth is connected without a real credential/consent test.
 
 Official sources checked on 2026-10-24:
 - https://docs.composio.dev/docs/sessions-via-mcp
@@ -152,10 +123,8 @@ results and unrelated failures separately. Build, review and push the approved
 changes to the owner's fork; replace the daily installed app only after relevant
 checks and native verification, with backup and the original updater disabled.
 
-## Explicit unresolved decisions
+## Approved execution
 
-The owner may prefer exclusive ownership rather than non-exclusive association;
-that changes migration and runtime-safety work materially. The proposal above
-chooses association to avoid silently restricting current workflows. Composio
-live setup needs an owner project key and each service's consent; neither is
-assumed present. No external credential has been requested or read in this design.
+Exclusive workspace ownership is approved. The user said to continue until all four points work, are tested and pushed to the fork. No further routine design/plan approval is needed. A missing external credential or human-only sign-in remains a genuine blocker only for that live integration; generic MCP can be implemented and tested with an owned fixture.
+
+Implemented transport compatibility: stdio and Streamable HTTP using the legacy MCP initialize handshake, negotiating 2024-11-05, 2025-03-26, 2025-06-18 or 2025-11-25. Unsupported negotiated versions fail closed. The newer 2026 protocol is not supported by this client. Discovery accepts at most 64 pages and 10,000 tools; service actions are never retried automatically.

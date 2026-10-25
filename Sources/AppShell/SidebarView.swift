@@ -942,10 +942,16 @@ public final class SidebarViewModel: ObservableObject {
                                              unreadCount: bot.notificationsEnabled ? unread : 0))
             }
             var conversations: [WorkspaceID: [WorkspaceConversationRow]] = [:]
+            // Group rooms have workspace ownership too, but only the first-class
+            // group surface may open them: the generic Agent App cannot send to them.
+            let groupRoomThreadIDs = Set(try botStore.listGroups(includeHidden: true).map(\.roomThreadID))
             for workspaceID in expanded {
                 var rows: [WorkspaceConversationRow] = []
-                for thread in try threadRepo.list(workspaceId: workspaceID)
+                let workspaceThreads = try threadRepo.list(workspaceId: workspaceID)
+                let linkedConversations = try botStore.conversationsLinked(to: Set(workspaceThreads.map(\.id)))
+                for thread in workspaceThreads
                 where !thread.isEphemeral && thread.parentThreadId == nil {
+                    guard !groupRoomThreadIDs.contains(thread.id), linkedConversations[thread.id]?.groupID == nil else { continue }
                     guard rows.count < Self.workspaceConversationLoadLimit || keepUntitled.contains(thread.id) else { continue }
                     guard !Self.isEmptyDraft(title: thread.title, id: thread.id, keep: keepUntitled, hasMessages: hasMessages) else { continue }
                     // Pinned Bot threads stay visible even when their generated title looks untitled.
@@ -953,7 +959,7 @@ public final class SidebarViewModel: ObservableObject {
                     if let pin {
                         guard pin.hostID == hostID, pin.context == .workspace(workspaceID),
                               thread.actor == .bot(pin.botID), thread.actorLockedAt != nil,
-                              let conversation = try botStore.conversation(id: pin.conversationID), !conversation.hidden,
+                              let conversation = try botStore.conversation(id: pin.conversationID), !conversation.hidden, conversation.groupID == nil,
                               conversation.botID == pin.botID, conversation.linkedAgentThreadID == thread.id,
                               try botStore.authorizesConversation(conversation, hostID: hostID, action: .read) else { continue }
                     } else if !Self.showsThread(title: thread.title, id: thread.id, keep: keepUntitled) {
@@ -1304,6 +1310,18 @@ public final class SidebarViewModel: ObservableObject {
 
     /// Opens the Teams manager.
     public func openTeams() { withBotsContent { $0.openTeamsManager() } }
+
+    func openGroup(_ id: BotGroupID) { withBotsContent { $0.openGroup(id) } }
+    func beginGroup() { withBotsContent { $0.beginCreateGroup() } }
+    func editGroup(_ id: BotGroupID) { withBotsContent { $0.teamsGroups.sheet = .editGroup(id) } }
+    func openHistory(botID: BotID, conversationID: BotConversationID) {
+        do {
+            guard let router, try router.openBotsDesk(botID: botID, conversationID: conversationID) else {
+                showOperationError("Could not open conversation", detail: "This Bot context is no longer available.")
+                return
+            }
+        } catch { showOperationError("Could not open conversation", detail: error.localizedDescription) }
+    }
 
     /// Opens the New Bot flow. From a workspace's "+ New bot" the Bot is exclusive to that workspace.
     public func addBot(inWorkspace workspaceID: WorkspaceID? = nil) {
@@ -2734,6 +2752,13 @@ public struct SidebarRootView: View {
     var botsVM: BotsViewModel?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var showsInsomniaOptions = false
+    private struct AssignmentRequest: Identifiable {
+        let id = UUID()
+        let workspaceID: WorkspaceID?
+        let resource: BotWorkspaceAssignmentResource?
+        var kind: WorkspaceAssignmentKind = .bots
+    }
+    @State private var assignmentRequest: AssignmentRequest?
     @State private var virtualMachineRequest: VirtualMachineRequest?
     /// Toggled to true to programmatically focus the filter field (Cmd+F).
     @State private var filterFocusRequest: Bool = false
@@ -2897,6 +2922,9 @@ public struct SidebarRootView: View {
                     .padding(.bottom, DS.Space.sm)
             }
 
+            if let botsVM {
+                SidebarGroupChats(vm: botsVM, sidebar: vm, controller: botsVM.teamsGroups, navigate: navigate)
+            }
             generalBotsSection
 
             HStack(spacing: DS.Space.sm) {
@@ -2997,6 +3025,12 @@ public struct SidebarRootView: View {
         // start below the traffic-light band.
         .ignoresSafeArea(.container, edges: .top)
         .preferredColorScheme(.dark)
+        .sheet(item: $assignmentRequest, onDismiss: { vm.reloadGeneralBots(); vm.reload() }) { request in
+            if let router = vm.router {
+                WorkspaceResourceAssignmentView(router: router, workspaceID: request.workspaceID,
+                                                resource: request.resource, initialKind: request.kind)
+            }
+        }
         .sheet(item: $virtualMachineRequest, onDismiss: { vm.reloadGeneralBots() }) { request in
             if let context = vm.context {
                 BotVirtualMachinesView(
@@ -3440,7 +3474,7 @@ public struct SidebarRootView: View {
     }
 
     private func botConversationRow(_ row: SidebarViewModel.AuthorizedBotConversationRow) -> some View {
-        let selected = vm.newBotConversationThreadID != nil && vm.deskSelection?.threadID == vm.newBotConversationThreadID && vm.deskSelection?.botID == row.botID && vm.deskSelection?.context == row.context
+        let selected = SidebarViewModel.isBotConversationSelected(botID: row.botID, context: row.context, in: vm.deskSelection)
         let running = SidebarViewModel.isBotRunning(row.botID, running: vm.runningBotIDs, runningLinked: vm.runningLinkedBotIDs)
         return Button {
             navigate { vm.startBotConversation(row) }
@@ -3474,9 +3508,12 @@ public struct SidebarRootView: View {
         .accessibilityValue(running ? "Running" : "")
         .accessibilityIdentifier("sidebar.botConversation.\(row.id)")
         .contextMenu {
+            Button("New conversation") { navigate { vm.startNewBotConversation(row) } }
+            Divider()
             let state = vm.botPinnedAndHidden(row.botID)
             Button(state.pinned ? "Unpin" : "Pin") { vm.setBotPinned(row.botID, !state.pinned) }
             Button(state.hidden ? "Unhide" : "Hide") { vm.setBotHidden(row.botID, !state.hidden) }
+            Button("Move to workspace…") { assignmentRequest = AssignmentRequest(workspaceID: nil, resource: .bot(row.botID)) }
             Button("Edit in Studio") { navigate { vm.editBot(row.botID) } }
             Button("Duplicate") { navigate { vm.duplicateBot(row.botID) } }
             Divider()
@@ -3522,12 +3559,15 @@ public struct SidebarRootView: View {
                     .padding(.horizontal, DS.Space.sm)
                     .padding(.vertical, DS.Space.xs)
             } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: DS.Space.xxs) {
-                        ForEach(bots) { generalBotRow($0) }
+                if let botsVM {
+                    SidebarTeamRoster(controller: botsVM.teamsGroups, rows: bots) { row in
+                        SidebarBotHistory(controller: botsVM.teamsGroups, sidebar: vm, vm: botsVM,
+                                          botID: row.botID, context: .general, row: generalBotRow(row), navigate: navigate)
                     }
+                } else {
+                    ScrollView { VStack(spacing: DS.Space.xxs) { ForEach(bots) { generalBotRow($0) } } }
+                        .frame(maxHeight: min(CGFloat(bots.count) * 38, 190))
                 }
-                .frame(maxHeight: min(CGFloat(bots.count) * 38, 190))
             }
         }
         .padding(.horizontal, DS.Space.md)
@@ -3537,7 +3577,7 @@ public struct SidebarRootView: View {
     }
 
     private func generalBotRow(_ row: SidebarViewModel.GeneralBotRow) -> some View {
-        let selected = vm.newBotConversationThreadID != nil && vm.deskSelection?.threadID == vm.newBotConversationThreadID && vm.deskSelection?.botID == row.botID && vm.deskSelection?.context == .general
+        let selected = SidebarViewModel.isGeneralBotSelected(row.botID, in: vm.deskSelection)
         let running = SidebarViewModel.isBotRunning(row.botID, running: vm.runningBotIDs, runningLinked: vm.runningLinkedBotIDs)
         let unread = row.isTitio ? SidebarViewModel.titioBadgeCount(vm.activityCounts) : row.unreadCount
         return Button { navigate { vm.openGeneralBot(row) } } label: {
@@ -3581,8 +3621,11 @@ public struct SidebarRootView: View {
         .accessibilityValue("\(running ? "Running. " : "")\(unread > 0 ? "\(unread) unread. " : "")\(row.pinned ? "Pinned. " : "")\(row.hidden ? "Hidden. " : "")General Bot")
         .accessibilityIdentifier("sidebar.generalBot.\(row.handle)")
         .contextMenu {
+            Button("New conversation") { navigate { vm.startNewGeneralBotConversation(row) } }
+            Divider()
             Button(row.pinned ? "Unpin" : "Pin") { vm.setBotPinned(row.botID, !row.pinned) }
             Button(row.hidden ? "Unhide" : "Hide") { vm.setBotHidden(row.botID, !row.hidden) }
+            Button("Move to workspace…") { assignmentRequest = AssignmentRequest(workspaceID: nil, resource: .bot(row.botID)) }
             Button("Edit in Studio") { navigate { vm.editBot(row.botID) } }
             Button("Duplicate") { navigate { vm.duplicateBot(row.botID) } }
             Divider()
@@ -3646,6 +3689,9 @@ public struct SidebarRootView: View {
         .help("Manage \(machine.name)")
         .accessibilityValue(machine.workspaceID == nil ? "General VM" : "Workspace VM")
         .accessibilityIdentifier("sidebar.vm.\(machine.id.uuidString.lowercased())")
+        .contextMenu {
+            Button("Move to workspace…") { assignmentRequest = AssignmentRequest(workspaceID: nil, resource: .virtualMachine(machine.id), kind: .virtualMachines) }
+        }
     }
 
     private func virtualMachineRowLabel(_ title: String, symbol: String, nested: Bool) -> some View {
@@ -3876,6 +3922,10 @@ public struct SidebarRootView: View {
         }
         if !vm.isWorkspaceSectionCollapsed(ws.id, .bots) {
         if vm.showsAddBot(ws.id) {
+            Button("Add existing bot…") { assignmentRequest = AssignmentRequest(workspaceID: ws.id, resource: nil) }
+                .buttonStyle(.plain).font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
+                .padding(.leading, Self.workspaceChildIndent + DS.Space.sm)
+                .accessibilityIdentifier("sidebar.addExistingBot.\(ws.id.value.uuidString)")
             Button { navigate { vm.addBot(inWorkspace: ws.id) } } label: {
                 HStack(spacing: DS.Space.sm) {
                     Image(systemName: "plus")
@@ -3897,7 +3947,12 @@ public struct SidebarRootView: View {
         let bots = vm.sectionSlice(SidebarViewModel.runningFirst(vm.workspaceBotRows(ws.id)) {
             SidebarViewModel.isBotRunning($0.botID, running: vm.runningBotIDs, runningLinked: vm.runningLinkedBotIDs)
         }, ws.id, .bots)
-        ForEach(bots.rows) { botConversationRow($0) }
+        ForEach(bots.rows) { row in
+            if let botsVM {
+                SidebarBotHistory(controller: botsVM.teamsGroups, sidebar: vm, vm: botsVM,
+                                  botID: row.botID, context: row.context, row: botConversationRow(row), navigate: navigate)
+            } else { botConversationRow(row) }
+        }
         if bots.hidden > 0 || bots.expanded {
             showMoreRow(expanded: bots.expanded, hidden: bots.hidden, noun: "bots",
                         id: "sidebar.botsToggle.\(ws.id.value.uuidString)") { vm.toggleSectionList(ws.id, .bots) }
@@ -3908,6 +3963,10 @@ public struct SidebarRootView: View {
         }
         if !vm.isWorkspaceSectionCollapsed(ws.id, .vms) {
         if vm.showsNewConversation(ws.id) {
+            Button("Add existing VM…") { assignmentRequest = AssignmentRequest(workspaceID: ws.id, resource: nil, kind: .virtualMachines) }
+                .buttonStyle(.plain).font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
+                .padding(.leading, Self.workspaceChildIndent + DS.Space.sm)
+                .accessibilityIdentifier("sidebar.addExistingVM.\(ws.id.value.uuidString)")
             newVirtualMachineRow(workspaceID: ws.id)
         }
         let machines = vm.sectionSlice(vm.workspaceVirtualMachineRows(ws.id), ws.id, .vms)

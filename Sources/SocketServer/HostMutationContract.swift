@@ -184,6 +184,8 @@ public enum HostMutationContract {
     bot.notice.clear
     bot.desktop.set
     bot.vm.save
+    bot.vm.transfer
+    bot.workspace.transfer
     bot.execution.set
     bot.avatar.set
     bot.handle.set
@@ -198,6 +200,7 @@ public enum HostMutationContract {
     bot.team.delete
     bot.team.reorder
     bot.group.create
+    bot.group.workspace.adopt
     bot.group.update
     bot.group.set_participants
     bot.group.send
@@ -452,6 +455,12 @@ public enum HostMutationContract {
                 return [.string("key")]
             case "bot.vm.save":
                 return [.string("name", nonempty: true)]
+            case "bot.vm.transfer":
+                return [.uuid("vm_id"), .optionalUUID("workspace_id"), .optionalUUID("expected_workspace_id")]
+            case "bot.workspace.transfer":
+                return [.uuid("bot_id"), .string("host_id", nonempty: true), .uuid("expected_current_revision_id"), .optionalUUID("workspace_id"), .optionalUUID("expected_workspace_id")]
+            case "bot.group.workspace.adopt":
+                return [.uuid("group_id"), .uuid("workspace_id"), .int("expected_revision")]
             case "bot.execution.set":
                 return [.uuid("bot_id"), .string("execution_destination", nonempty: true)]
             case "bot.reorder":

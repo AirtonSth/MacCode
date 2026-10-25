@@ -1108,17 +1108,16 @@ final class ClaudeAgentSDKBridgeEffortAndErrorTests: ProviderProcessTestCase {
                       "query options must use the app-selected Claude executable path as the runtime authority")
     }
 
-    func test_bridgeRefreshesBotMCPAndKeepsIdentitySeparateOnEveryTurn() throws {
-        // WHY: Claude SDK reuses one query for multiple turns. A server admitted
-        // only at query creation retains a stale run_id and fails the exact-run
-        // authorization gate on the next mention. The bridge must refresh the
-        // dynamic MCP before it delivers each untouched user prompt.
+    func test_bridgeRejectsChangedManagedIdentityBeforePromptAndPreservesSameIdentityTurns() throws {
+        // SDK child environment is immutable; native coordinator recycles sessions for new run capabilities.
         guard let node = ProcessLocator.resolve("node") else { throw XCTSkip("node not available") }
         let serverName = BotSelfConfigMCPAdmit.serverName
         let session = try RealBridgeHarness(node: node, fakeSDKIndexJS: """
         export function createSdkMcpServer() { return { instance: { server: {} } }; }
         export function tool(name, description, schema, handler) { return { name, description, schema, handler }; }
         export function query({ prompt, options }) {
+          process.stdout.write(JSON.stringify({type: "fixture_query_spawn"}) + "\\n");
+          const childEnv = { ...options.env };
           let servers = options.mcpServers || {};
           const allowed = options.allowedTools || [];
           return {
@@ -1129,7 +1128,10 @@ final class ClaudeAgentSDKBridgeEffortAndErrorTests: ProviderProcessTestCase {
             async *[Symbol.asyncIterator]() {
               for await (const message of prompt) {
                 const content = message.message.content || [];
-                const run = servers['\(serverName)']?.env?.RC_REMOTE_CODE_ROOT_RUN_ID || 'NO_RUN';
+                const configuredRun = servers['\(serverName)']?.env?.RC_REMOTE_CODE_ROOT_RUN_ID;
+                const run = configuredRun?.startsWith('${')
+                  ? childEnv[configuredRun.slice(2, -1)]
+                  : (configuredRun || 'NO_RUN');
                 const text = 'OBS:' + (content[0]?.text || '') + '|CTX:' + (content[1]?.text || '') + '|RUN:' + run + '|ALLOWED:' + allowed.join(',');
                 yield { type: 'assistant', message: { id: 'peer-' + run, content: [{ type: 'text', text }] }, session_id: 'fake-peer-session' };
                 yield { type: 'result', subtype: 'success', is_error: false, result: 'done-' + run, session_id: 'fake-peer-session' };
@@ -1159,7 +1161,7 @@ final class ClaudeAgentSDKBridgeEffortAndErrorTests: ProviderProcessTestCase {
             "interaction_mode": "default",
             "provider_thread_id": "",
             "session_id": UUID().uuidString,
-            "environment": [:],
+            "environment": [BotPeerDelegation.capabilityEnvironmentKey: "CAP_ONE", BotPeerDelegation.threadEnvironmentKey: "THREAD_ONE"],
             "mcp_servers": server("RUN_ONE"),
             "allowed_tools": BotSelfConfigMCPAdmit.claudeAutomaticallyAllowedTools,
             "claude_executable_path": "/usr/bin/true",
@@ -1176,16 +1178,75 @@ final class ClaudeAgentSDKBridgeEffortAndErrorTests: ProviderProcessTestCase {
             "type": "rc_turn",
             "prompt": "ORIGINAL_TWO",
             "turn_context": "IDENTITY_TWO",
-            "mcp_servers": server("RUN_TWO"),
+            "mcp_servers": server("RUN_ONE"),
         ])
-        XCTAssertTrue(session.waitFor("done-RUN_TWO"), "second SDK turn did not receive refreshed MCP context: \(session.stderrText())")
+        XCTAssertTrue(session.waitFor("OBS:ORIGINAL_TWO"), "same-identity callback did not complete: \(session.stderrText())")
         XCTAssertTrue(session.output.contains("OBS:ORIGINAL_ONE|CTX:<remote_code_turn_context>\\nIDENTITY_ONE"))
         XCTAssertTrue(session.output.contains("|RUN:RUN_ONE"))
         XCTAssertTrue(session.output.contains("OBS:ORIGINAL_TWO|CTX:<remote_code_turn_context>\\nIDENTITY_TWO"))
-        XCTAssertTrue(session.output.contains("|RUN:RUN_TWO"),
-                      "the long-lived query must replace the stale first-run MCP before the next user turn")
+        let error = "Managed host identity changed. Start a new provider session before sending another turn."
+        let forbiddenTurns: [[String: Any]] = [
+            ["type": "rc_turn", "prompt": "REJECT_SERVER", "mcp_servers": server("RUN_TWO")],
+            ["type": "rc_turn", "prompt": "REJECT_ENVIRONMENT", "environment": [BotPeerDelegation.runEnvironmentKey: "RUN_TWO"]],
+            ["type": "rc_turn", "prompt": "REJECT_ENV", "env": [BotPeerDelegation.runEnvironmentKey: "RUN_TWO"], "mcp_servers": server("RUN_ONE")],
+            ["type": "rc_turn", "prompt": "REJECT_CAP", "env": [BotPeerDelegation.capabilityEnvironmentKey: "CAP_TWO"]],
+            ["type": "rc_turn", "prompt": "REJECT_THREAD", "environment": [BotPeerDelegation.threadEnvironmentKey: "THREAD_TWO"]],
+        ]
+        for (index, turn) in forbiddenTurns.enumerated() {
+            try session.send(turn)
+            let deadline = Date().addingTimeInterval(5)
+            while session.output.components(separatedBy: error).count - 1 < index + 1, Date() < deadline { Thread.sleep(forTimeInterval: 0.01) }
+            XCTAssertEqual(session.output.components(separatedBy: error).count - 1, index + 1, "changed authority must fail closed")
+        }
+        try session.send(["type": "rc_turn", "prompt": "AFTER_REJECTION", "mcp_servers": server("RUN_ONE")])
+        XCTAssertTrue(session.waitFor("OBS:AFTER_REJECTION"), "rejected authority must not mutate the old query")
+        XCTAssertEqual(session.output.components(separatedBy: "fixture_query_spawn").count - 1, 1)
+        XCTAssertFalse(session.output.contains("OBS:REJECT_"))
+        XCTAssertFalse(session.output.contains("done-RUN_TWO"))
         XCTAssertTrue(session.output.contains("|ALLOWED:\(BotSelfConfigMCPAdmit.claudeAutomaticallyAllowedTools.joined(separator: ","))"),
                       "SDK supervised mode must pre-authorize only RemoteCode's host-guarded Bot delegation tools")
+    }
+
+    func test_bridgeSDKChildMCPArgumentsUseReferencesAndKeepExactAuthorityOnlyInEnvironment() throws {
+        guard let node = ProcessLocator.resolve("node") else { throw XCTSkip("node not available") }
+        let capabilityKey = BotPeerDelegation.capabilityEnvironmentKey
+        let sentinel = "sdk-child-argv-capability-sentinel"
+        let session = try RealBridgeHarness(node: node, fakeSDKIndexJS: """
+        export function createSdkMcpServer() { return { instance: { server: {} } }; }
+        export function tool(name, description, schema, handler) { return { name, description, schema, handler }; }
+        export function query({ prompt, options }) {
+          // Match pinned SDK0.3.157's child argv construction exactly.
+          const childArgv = ['--mcp-config', JSON.stringify({mcpServers: options.mcpServers})];
+          const secretInArgv = childArgv.some(value => value.includes('\(sentinel)'));
+          const childEnv = { ...options.env };
+          const envIsExact = childEnv['\(capabilityKey)'] === '\(sentinel)';
+          const names = ['\(BotSelfConfigMCPAdmit.serverName)', '\(ConnectionMCPCatalog.serverName)'];
+          const refsAreExact = names.every(name => options.mcpServers[name]?.env?.['\(capabilityKey)'] === '${\(capabilityKey)}');
+          return {
+            async *[Symbol.asyncIterator]() {
+              for await (const message of prompt) {
+                yield { type: 'result', subtype: 'success', is_error: false,
+                  result: 'SDK_MCP_BOUNDARY:' + (!secretInArgv && envIsExact && refsAreExact ? 'SAFE' : 'UNSAFE'),
+                  session_id: 'owned-sdk-fixture' };
+              }
+            }
+          };
+        }
+        """)
+        defer { _ = session.finish() }
+        let environment = [capabilityKey: sentinel, BotPeerDelegation.runEnvironmentKey: "owned-run"]
+        let servers: [String: Any] = [BotSelfConfigMCPAdmit.serverName, ConnectionMCPCatalog.serverName].reduce(into: [:]) { result, name in
+            result[name] = ["command": "/usr/bin/true", "env": environment]
+        }
+        try session.send([
+            "type": "rc_configure", "bridge_protocol_version": ClaudeAgentSDKBridgeAdapter.bridgeProtocolVersion,
+            "expected_sdk_version": "0.3.157", "cwd": NSTemporaryDirectory(), "model": "fixture",
+            "permission_mode": "supervised", "interaction_mode": "default", "session_id": UUID().uuidString,
+            "environment": environment, "mcp_servers": servers, "claude_executable_path": "/usr/bin/true",
+        ])
+        try session.send(["type": "rc_turn", "prompt": "Owned fixture", "mcp_servers": servers])
+        XCTAssertTrue(session.waitFor("SDK_MCP_BOUNDARY:SAFE"), "managed credentials must reach the SDK child through environment references: \(session.stderrText())")
+        XCTAssertFalse(session.output.contains(sentinel))
     }
 
     // WHY (AG-007): an approval response normally carries only the decision.
@@ -1591,7 +1652,7 @@ final class ClaudeAgentSDKBridgeEffortAndErrorTests: ProviderProcessTestCase {
 
     func test_nativeForkDuplicateMarkerCleansAllChildrenAndFailsLoud() async throws {
         let key = "remotecode-thread-fork:duplicate"
-        let marker = "RemoteCode fork \(key)"
+        let marker = "MacCode fork \(key)"
         let mutator = ClaudeForkMutationMock(sessions: [
             ClaudeSDKSessionRecord(sessionId: "claude-parent", customTitle: nil),
             ClaudeSDKSessionRecord(sessionId: "duplicate-a", customTitle: marker),

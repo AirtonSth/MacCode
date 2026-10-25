@@ -258,18 +258,18 @@ final class CodexRunnerArgsTests: XCTestCase {
             BotComputerMCPAdmit.serverName,
             BotWebMCPAdmit.serverName,
         ] {
-            XCTAssertTrue(overrides.contains { $0.contains("mcp_servers.\(name).env.RC_REMOTE_CODE_BOT_ID=\"bot-proof\"") })
+            XCTAssertTrue(overrides.contains { $0.hasPrefix("mcp_servers.\(name).env_vars=") && $0.contains("\"RC_REMOTE_CODE_BOT_ID\"") })
         }
         XCTAssertTrue(
             overrides.contains {
                 $0.contains(
-                    "mcp_servers.\(BotSelfConfigMCPAdmit.serverName).env.\(BotPeerDelegation.capabilityEnvironmentKey)=\"capability-proof\""
-                )
+                    "mcp_servers.\(BotSelfConfigMCPAdmit.serverName).env_vars="
+                ) && $0.contains("\"\(BotPeerDelegation.capabilityEnvironmentKey)\"")
             },
-            "bot self-config must receive the exact delegated-run capability, not only a tool name"
+            "bot self-config must inherit the exact delegated-run capability from the current process environment"
         )
         XCTAssertFalse(
-            overrides.contains { $0.contains("mcp_servers.\(BotBrowserMCPAdmit.serverName).env.\(BotPeerDelegation.capabilityEnvironmentKey)") },
+            overrides.contains { $0.hasPrefix("mcp_servers.\(BotBrowserMCPAdmit.serverName).env_vars=") && $0.contains("\"\(BotPeerDelegation.capabilityEnvironmentKey)\"") },
             "peer capability must stay scoped to bot self-config"
         )
     }
@@ -293,7 +293,7 @@ final class CodexRunnerArgsTests: XCTestCase {
             BotWebMCPAdmit.serverName,
         ] {
             XCTAssertTrue(rawResume.contains { $0.contains("mcp_servers.\(name).command=") }, name)
-            XCTAssertTrue(rawResume.contains { $0.contains("mcp_servers.\(name).env.RC_REMOTE_CODE_BOT_ID=\"bot-proof\"") }, name)
+            XCTAssertTrue(rawResume.contains { $0.hasPrefix("mcp_servers.\(name).env_vars=") && $0.contains("\"RC_REMOTE_CODE_BOT_ID\"") }, name)
         }
 
         let rawAppServer = AgentSkillInstaller.providerProxyArguments(

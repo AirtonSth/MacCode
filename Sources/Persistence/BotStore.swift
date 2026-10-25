@@ -143,7 +143,7 @@ public final class BotStore: @unchecked Sendable {
         listCacheState.withLock { botsListRevisionValue }
     }
 
-    private func bumpBotsListRevision() {
+    func bumpBotsListRevision() {
         listCacheState.withLock { botsListRevisionValue += 1 }
     }
 

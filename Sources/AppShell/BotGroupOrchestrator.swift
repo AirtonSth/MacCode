@@ -95,7 +95,7 @@ final class BotGroupOrchestrator: AgentRunObserver {
 
     // MARK: - Groups
 
-    /// Creates the quiet room thread (no workspace) and the group with one
+    /// Creates the quiet room thread in its participants' common workspace and one
     /// hidden member conversation per participant.
     func createGroup(
         title: String,
@@ -106,9 +106,14 @@ final class BotGroupOrchestrator: AgentRunObserver {
         participantBotIDs: [BotID]
     ) async throws -> BotGroupConversation {
         guard let router else { throw BotStoreError.invalidRow("Bot runtime is unavailable") }
+        let workspace = try botStore.proposedGroupWorkspace(botIDs: participantBotIDs)
+        if let workspace, router.context?.state.workspaces[workspace] == nil {
+            throw BotStoreError.invalidInput("This workspace is no longer available.")
+        }
+        guard let hostID = router.context?.liveActivityHostIdentity.serverId else { throw BotStoreError.notFound }
         let provider = AgentProvider.defaultProvider
         let room = try router.createAgentThread(
-            workspace: nil,
+            workspace: workspace,
             title: title,
             provider: provider,
             model: BotsViewModel.defaultModel(for: provider),
@@ -125,12 +130,56 @@ final class BotGroupOrchestrator: AgentRunObserver {
                 policy: policy,
                 leadBotID: leadBotID,
                 maxAutoHops: maxAutoHops,
-                participantBotIDs: participantBotIDs
+                participantBotIDs: participantBotIDs,
+                hostID: hostID
             )
         } catch {
             try? await router.deleteAgentThread(thread: room.id)
             throw error
         }
+    }
+
+    @discardableResult
+    func adoptWorkspace(groupID: BotGroupID, expectedRevision: Int, workspaceID: WorkspaceID) throws -> BotGroupConversation {
+        guard let context = router?.context, context.state.workspaces[workspaceID] != nil else {
+            throw BotStoreError.invalidInput("This workspace is no longer available.")
+        }
+        guard let group = try botStore.group(id: groupID) else { throw BotStoreError.notFound }
+        let room = group.roomThreadID
+        guard coordinator.activeRunId(threadId: room) == nil,
+              !coordinator.hasPendingProviderStart(threadId: room),
+              !coordinator.hasProviderSession(threadId: room),
+              !coordinator.isPreparingProviderStart(threadId: room) else {
+            throw BotStoreError.invalidInput("This group room has work starting or in progress. Finish it before assigning the workspace.")
+        }
+        return try botStore.adoptEmptyGroupWorkspace(groupID: groupID, expectedRevision: expectedRevision,
+            workspaceID: workspaceID, hostID: context.liveActivityHostIdentity.serverId)
+    }
+
+    func validateParticipants(groupID: BotGroupID, botIDs: [BotID]) throws {
+        guard router?.context != nil else { throw BotStoreError.notFound }
+        if try botStore.groupWorkspaceID(groupID: groupID) == nil {
+            _ = try botStore.proposedGroupWorkspace(botIDs: botIDs)
+        }
+    }
+
+    var workspaceHostID: String? { router?.context?.liveActivityHostIdentity.serverId }
+
+    /// Existing General rooms can acquire a workspace only while provably empty.
+    /// Established rooms and member pins never change context as a side effect of sending.
+    private func prepareGroupScope(_ groupID: BotGroupID) throws -> BotGroupConversation {
+        guard var group = try botStore.group(id: groupID), let context = router?.context else { throw BotStoreError.notFound }
+        let participants = try botStore.listGroupParticipants(groupID: groupID).map(\.botID)
+        if try botStore.groupWorkspaceID(groupID: groupID) == nil,
+           let workspace = try botStore.proposedGroupWorkspace(botIDs: participants) {
+            group = try adoptWorkspace(groupID: groupID, expectedRevision: group.revision, workspaceID: workspace)
+        }
+        if let workspace = try botStore.groupWorkspaceID(groupID: groupID), context.state.workspaces[workspace] == nil {
+            throw BotStoreError.invalidInput("This group's workspace is no longer available.")
+        }
+        try botStore.validateGroupWorkspaceAccess(groupID: groupID, botIDs: participants,
+            hostID: context.liveActivityHostIdentity.serverId)
+        return group
     }
 
     // MARK: - Send
@@ -149,7 +198,7 @@ final class BotGroupOrchestrator: AgentRunObserver {
         guard attachments.isEmpty else { throw SendError.attachmentsUnsupported }
         let message = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !message.isEmpty else { throw SendError.emptyMessage }
-        guard let group = try botStore.group(id: groupID) else { throw BotStoreError.notFound }
+        guard var group = try botStore.group(id: groupID) else { throw BotStoreError.notFound }
         let existingTurns = try botStore.listGroupTurns(groupID: groupID)
         if let submitKey,
            let receipt = try replayedReceipt(group: group, turns: existingTurns, submitKey: submitKey, text: message) {
@@ -168,6 +217,7 @@ final class BotGroupOrchestrator: AgentRunObserver {
         case .rejected(let rejection): throw SendError.rejected(rejection.message)
         case .turns(let planned): turnsToPlan = planned
         }
+        group = try prepareGroupScope(groupID)
 
         let roundID = BotGroupRoundID()
         let userMessage = AgentMessage(threadId: group.roomThreadID, role: .user, content: message, createdAt: now)
@@ -448,6 +498,7 @@ final class BotGroupOrchestrator: AgentRunObserver {
         }
         let member: (conversation: BotConversation, thread: AgentThread)
         do {
+            _ = try prepareGroupScope(turn.groupID)
             member = try ensureMemberThread(group: group, bot: bot, revision: revision, router: router)
         } catch {
             return fail(Self.describe(error), runID: nil)
@@ -456,7 +507,8 @@ final class BotGroupOrchestrator: AgentRunObserver {
         let onVM = member.thread.executionTarget == .vm
 
         // A rebuild or stop holds the bot's VM: wait, persisted.
-        if onVM, let holder = BotVMRunRegistry.shared.blocker(botID: bot.id, threadID: threadID) {
+        let resourceID = try? botStore.guestResourceID(botID: bot.id, threadID: threadID)
+        if onVM, let holder = BotVMRunRegistry.shared.blocker(botID: bot.id, threadID: threadID, resourceID: resourceID) {
             if turn.state != .waitingForBot {
                 move(turn, from: [.planned], to: .waitingForBot, roomThreadID: roomThreadID)
             }
@@ -485,7 +537,8 @@ final class BotGroupOrchestrator: AgentRunObserver {
             if let vmPreflight {
                 failure = await vmPreflight(bot.id)
             } else {
-                failure = await router.botVMPreflight(bot.id, workspace: nil, threadID: threadID)
+                failure = await router.botVMPreflight(bot.id,
+                    workspace: member.thread.workspaceId.flatMap { router.context?.state.workspaces[$0]?.cwd }, threadID: threadID)
             }
             if let failure { return fail(failure, runID: runID) }
         }
@@ -552,7 +605,9 @@ final class BotGroupOrchestrator: AgentRunObserver {
                 modelSelection: routing.modelSelection,
                 providerInstanceId: routing.providerInstanceID,
                 requestedRunID: runID,
-                executionCwdOverride: home.root.path,
+                executionCwdOverride: member.thread.worktreePath
+                    ?? member.thread.workspaceId.flatMap { router.context?.state.workspaces[$0]?.cwd }
+                    ?? home.root.path,
                 allowProviderCatalogListingDuringPreflight: false
             )
             guard result.status != .queued else {
@@ -623,6 +678,7 @@ final class BotGroupOrchestrator: AgentRunObserver {
             throw BotStoreError.invalidInput("\(bot.name) is not in this group.")
         }
         if let linked = conversation.linkedAgentThreadID, let thread = try threadRepo.get(id: linked) {
+            try validateMemberScope(group: group, bot: bot, conversation: conversation, thread: thread, router: router)
             let updated = try threadRepo.reconcileBotExecutionTarget(thread)
             if updated.executionTarget != thread.executionTarget {
                 router.publishAgentThreadUpdated(updated)
@@ -643,6 +699,23 @@ final class BotGroupOrchestrator: AgentRunObserver {
             lastUsed: AgentLastModelStore.shared.model(for: routing.provider)
         )
         let model = routing.resolvedModel(defaultModel: BotsViewModel.defaultModel(for:))
+        if let workspace = try botStore.groupWorkspaceID(groupID: group.id) {
+            guard let hostID = router.context?.liveActivityHostIdentity.serverId,
+                  let binding = try botStore.getContextBinding(hostID: hostID, botID: bot.id, context: .workspace(workspace)),
+                  binding.state == .active, binding.actions.isSuperset(of: [.read, .send]) else {
+                throw BotStoreError.invalidInput("This bot's workspace access is inactive or changed.")
+            }
+            let thread = AgentThread(workspaceId: workspace, title: group.title, provider: routing.provider,
+                providerInstanceId: routing.providerInstanceID, model: model, permissionMode: routing.permissionMode,
+                reasoningEffort: routing.reasoningEffort, serviceTier: routing.serviceTier,
+                modelSelection: routing.modelSelection, runAsUser: routing.runAsUser)
+            let destination = try botStore.executionDestination(botID: bot.id)
+            let linked = try botStore.bindWorkspaceGroupMemberThread(groupID: group.id, botID: bot.id,
+                newThread: thread, hostID: hostID, policyRevision: binding.policyRevision, destination: destination)
+            guard let saved = try threadRepo.get(id: thread.id) else { throw BotStoreError.notFound }
+            router.publishAgentThreadUpdated(saved)
+            return (linked, saved)
+        }
         var thread = try router.createAgentThread(
             workspace: nil,
             title: group.title,
@@ -671,6 +744,24 @@ final class BotGroupOrchestrator: AgentRunObserver {
         conversation.linkedAgentThreadID = thread.id
         try botStore.upsertConversation(conversation)
         return (conversation, thread)
+    }
+
+    private func validateMemberScope(group: BotGroupConversation, bot: BotDefinition, conversation: BotConversation,
+        thread: AgentThread, router: AppCommandRouter) throws {
+        guard let workspace = try botStore.groupWorkspaceID(groupID: group.id) else {
+            guard bot.workspaceID == nil, try botStore.conversationContextPin(conversationID: conversation.id) == nil else {
+                throw BotStoreError.invalidInput("This General group cannot continue a workspace bot's conversation. Create a new workspace group.")
+            }
+            return
+        }
+        guard thread.workspaceId == workspace, thread.actor == .bot(bot.id),
+              let hostID = router.context?.liveActivityHostIdentity.serverId,
+              let pin = try botStore.conversationContextPin(conversationID: conversation.id),
+              pin.hostID == hostID, pin.botID == bot.id, pin.context == .workspace(workspace),
+              try botStore.authorizesConversation(conversation, hostID: hostID, action: .read),
+              try botStore.authorizesConversation(conversation, hostID: hostID, action: .send) else {
+            throw BotStoreError.invalidInput("This group member's workspace access changed. Its original conversation has been preserved; create a new group with current access.")
+        }
     }
 
     // MARK: - Settle

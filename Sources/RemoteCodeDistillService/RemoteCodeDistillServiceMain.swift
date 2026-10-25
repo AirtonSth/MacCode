@@ -40,6 +40,13 @@ struct RemoteCodeDistillServiceMain {
             await runComputerUseMCP()
             return
         }
+        if programName == ConnectionMCPCatalog.serverName || rawArgs.dropFirst().first == ConnectionMCPCatalog.cliArgument {
+            let server = ManagedConnectionsMCP()
+            while let line = readLine(strippingNewline: true) {
+                if let response = server.handle(line) { FileHandle.standardOutput.write(Data((response + "\n").utf8)) }
+            }
+            return
+        }
         if programName == "rc-bot-self-config"
             || rawArgs.dropFirst().first == BotSelfConfigCatalog.cliArgument {
             runBotSelfConfigMCP()

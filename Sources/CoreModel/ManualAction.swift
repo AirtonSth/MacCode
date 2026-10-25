@@ -93,6 +93,7 @@ public final class BotComputerControl: @unchecked Sendable {
     private var controlled: [BotID: BotID] = [:]
     private var resourceLookup: @Sendable (BotID, AgentThreadID?) -> BotID = { bot, _ in bot }
     private var requests: [BotID: ManualActionRequest] = [:]
+    private var workspaceMaintenance: Set<BotID> = []
 
     public init(now: @escaping @Sendable () -> Date = { Date() }) {
         self.now = now
@@ -113,19 +114,37 @@ public final class BotComputerControl: @unchecked Sendable {
     }
 
     /// The user starts driving. An open request becomes `taken`.
-    public func take(_ bot: BotID, threadID: AgentThreadID? = nil) {
+    @discardableResult
+    public func take(_ bot: BotID, threadID: AgentThreadID? = nil) -> Bool {
         let lookup = lock.withLock { resourceLookup }
         let resource = lookup(bot, threadID ?? openRequest(bot)?.threadID)
-        let changed = lock.withLock {
+        let outcome = lock.withLock { () -> (allowed: Bool, changed: Bool) in
+            guard !workspaceMaintenance.contains(bot), !workspaceMaintenance.contains(resource) else { return (false, false) }
             let inserted = controlled[bot] != resource
             controlled[bot] = resource
             if var request = requests[bot], request.state == .open {
                 request.state = .taken
                 requests[bot] = request
             }
-            return inserted
+            return (true, inserted)
         }
-        if changed { postChanged(bot) }
+        if outcome.changed { postChanged(bot) }
+        return outcome.allowed
+    }
+
+    /// Reserves user-control ownership while catalog scope is committed. `take`
+    /// fails honestly while reserved; it never waits then takes a changed scope.
+    public func withWorkspaceMaintenance<T>(resourceIDs: Set<BotID>, botIDs: Set<BotID>, _ body: () throws -> T) throws -> T {
+        let reserved = resourceIDs.union(botIDs)
+        try lock.withLock {
+            guard workspaceMaintenance.isDisjoint(with: reserved),
+                  !controlled.contains(where: { botIDs.contains($0.key) || resourceIDs.contains($0.value) }) else {
+                throw BotWorkspaceControlError.inUse
+            }
+            workspaceMaintenance.formUnion(reserved)
+        }
+        defer { lock.withLock { workspaceMaintenance.subtract(reserved) } }
+        return try body()
     }
 
     /// Hands control back to the bot. The request stays until `dismiss`.
@@ -198,6 +217,11 @@ public final class BotComputerControl: @unchecked Sendable {
             return request
         }
     }
+}
+
+public enum BotWorkspaceControlError: Error, LocalizedError {
+    case inUse
+    public var errorDescription: String? { "This computer is under user control or being moved. Return control before moving it." }
 }
 
 /// In-process notifications from the host apply path to the app layer that

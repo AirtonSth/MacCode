@@ -4341,6 +4341,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             appSupportDirectory: ctx.appSupportDirectory
         )
         created.onVMWorkspaceExists = { [weak self] id in self?.context?.state.workspaces[id] != nil }
+        created.workspaceAssignmentHostID = { [weak self] in self?.context?.liveActivityHostIdentity.serverId }
+        created.onWorkspaceAssignmentChanged = {
+            EventBus.shared.publish(kind: .botUpdated, payload: .object(["method": .string("bot.workspace.transfer")]))
+        }
         created.onHasLiveRun = { [weak self] id in
             self?.botsViewModel?.hasLiveRun(botID: id) ?? false
         }

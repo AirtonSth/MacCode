@@ -890,6 +890,157 @@ final class BotGroupOrchestratorTests: XCTestCase {
         XCTAssertEqual(try f.ctx.botStore.groupTurn(id: receipt.turns[0].id)?.state, .interrupted)
     }
 
+    func test_workspaceExclusiveSharedVMBotUsesPinnedWorkspaceCWDConnectionsAndNoGlobalMemory() async throws {
+        let f = try makeFixture()
+        let directory = URL(fileURLWithPath: f.support).appendingPathComponent("airtours", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let workspace = try f.router.createWorkspace(name: "Airtours", cwd: directory.path)
+        let owned = try f.ctx.botStore.transferBotWorkspace(botID: f.ana.id,
+            hostID: f.ctx.liveActivityHostIdentity.serverId, workspaceID: workspace.id,
+            expectedWorkspaceID: nil, expectedCurrentRevisionID: f.ana.currentRevisionID).bot
+        let machine = try f.ctx.botStore.saveVirtualMachine(name: "Airtours", workspaceID: workspace.id)
+        try f.ctx.botStore.setExecutionDestination(.virtualMachine(machine.id), botID: owned.id)
+        try BotHome(appSupportDirectory: f.ctx.appSupportDirectory, bot: owned)
+            .writeFile(relativePath: "MEMORY.md", contents: "PRIVATE-GENERAL-MEMORY-MUST-NOT-CROSS")
+        let group = try await makeGroup(f, bots: [owned])
+        XCTAssertEqual(try f.ctx.threadRepo.get(id: group.roomThreadID)?.workspaceId, workspace.id)
+        _ = try f.orchestrator.send(groupID: group.id, text: "Inspect Airtours")
+        let started = await waitUntil { f.runner.requests.count == 1 }
+        XCTAssertTrue(started)
+        let request = try XCTUnwrap(f.runner.requests.first)
+        let conversation = try XCTUnwrap(f.ctx.botStore.conversationLinked(to: request.threadId))
+        let pin = try XCTUnwrap(f.ctx.botStore.conversationContextPin(conversationID: conversation.id))
+        XCTAssertEqual(pin.context, .workspace(workspace.id))
+        XCTAssertEqual(try f.ctx.threadRepo.get(id: request.threadId)?.workspaceId, workspace.id)
+        XCTAssertEqual(request.cwd, directory.path)
+        XCTAssertEqual(try f.ctx.botStore.guestResourceID(botID: owned.id, threadID: request.threadId), machine.storageID)
+        XCTAssertFalse(request.prompt.contains("PRIVATE-GENERAL-MEMORY-MUST-NOT-CROSS"))
+        let connection = AppConnection(name: "Airtours service", kind: .stdio, endpoint: "/usr/bin/true",
+            access: ConnectionAccess(workspaceIDs: [workspace.id.value.uuidString]))
+        try ConnectionStore(db: f.ctx.db).save(connection)
+        let listed = try await f.router.connectionMCP(message: [
+            "jsonrpc": .string("2.0"), "id": .number(1), "method": .string("tools/call"),
+            "params": .object(["name": .string(ConnectionMCPCatalog.list), "arguments": .object([:])]),
+        ], threadID: request.threadId, runID: request.runId,
+            capability: request.environment[BotPeerDelegation.capabilityEnvironmentKey])
+        let text = listed.objectValue?["content"]?.arrayValue?.first?.objectValue?["text"]?.stringValue ?? ""
+        XCTAssertTrue(text.contains(connection.id.uuidString.lowercased()), "the real host boundary resolves the workspace grant for the group member")
+        f.runner.finish(runID: request.runId, status: .completed, reply: "Workspace verified")
+        let completed = await waitUntil { (try? self.turns(f, group).first?.state) == .completed }
+        XCTAssertTrue(completed)
+        let oldPin = try XCTUnwrap(f.ctx.botStore.conversationContextPin(conversationID: conversation.id))
+        let revoked = try f.ctx.botStore.revokeContext(hostID: pin.hostID, botID: owned.id,
+            context: pin.context, expectedRevision: pin.policyRevision)
+        let roomCount = try room(f, group).count
+        XCTAssertThrowsError(try f.orchestrator.send(groupID: group.id, text: "Try after revocation"))
+        XCTAssertEqual(f.runner.requests.count, 1)
+        XCTAssertEqual(try room(f, group).count, roomCount)
+        XCTAssertEqual(try f.ctx.botStore.conversationContextPin(conversationID: conversation.id), oldPin)
+        _ = try f.ctx.botStore.grantContext(hostID: pin.hostID, botID: owned.id, context: pin.context,
+            actions: [.read, .send], expectedRevision: revoked.policyRevision)
+        let changed = try f.orchestrator.send(groupID: group.id, text: "Try with a different policy revision")
+        let refused = await waitUntil { (try? f.ctx.botStore.groupTurn(id: changed.turns[0].id)?.state) == .failed }
+        XCTAssertTrue(refused)
+        XCTAssertEqual(f.runner.requests.count, 1, "new authority cannot silently retarget an existing immutable member pin")
+        XCTAssertEqual(try f.ctx.botStore.conversationContextPin(conversationID: conversation.id), oldPin)
+    }
+
+    func test_existingEmptyGroupAdoptsOwnedWorkspaceWithoutReplacingItsIdentity() async throws {
+        let f = try makeFixture()
+        let group = try await makeGroup(f, bots: [f.ana])
+        let originalMembers = try f.ctx.botStore.listGroupParticipants(groupID: group.id)
+        let directory = URL(fileURLWithPath: f.support).appendingPathComponent("airtours", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let workspace = try f.router.createWorkspace(name: "Airtours", cwd: directory.path)
+        _ = try f.ctx.botStore.transferBotWorkspace(botID: f.ana.id,
+            hostID: f.ctx.liveActivityHostIdentity.serverId, workspaceID: workspace.id,
+            expectedWorkspaceID: nil, expectedCurrentRevisionID: f.ana.currentRevisionID)
+        _ = try f.orchestrator.send(groupID: group.id, text: "First Airtours message")
+        XCTAssertEqual(try f.ctx.botStore.groupWorkspaceID(groupID: group.id), workspace.id)
+        XCTAssertEqual(try f.ctx.botStore.group(id: group.id)?.roomThreadID, group.roomThreadID)
+        XCTAssertEqual(try f.ctx.botStore.listGroupParticipants(groupID: group.id), originalMembers)
+        let started = await waitUntil { f.runner.requests.count == 1 }
+        XCTAssertTrue(started)
+        let request = try XCTUnwrap(f.runner.requests.first)
+        XCTAssertEqual(request.cwd, directory.path)
+        f.runner.finish(runID: request.runId, status: .completed, reply: "Done")
+    }
+
+    func test_existingGeneralHistoryCannotBeRelabeledAfterParticipantBecomesWorkspaceExclusive() async throws {
+        let f = try makeFixture()
+        let group = try await makeGroup(f, bots: [f.ana])
+        let history = AgentMessage(threadId: group.roomThreadID, role: .user, content: "Original General history")
+        try f.ctx.messageRepo.append(history)
+        let directory = URL(fileURLWithPath: f.support).appendingPathComponent("airtours", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let workspace = try f.router.createWorkspace(name: "Airtours", cwd: directory.path)
+        _ = try f.ctx.botStore.transferBotWorkspace(botID: f.ana.id,
+            hostID: f.ctx.liveActivityHostIdentity.serverId, workspaceID: workspace.id,
+            expectedWorkspaceID: nil, expectedCurrentRevisionID: f.ana.currentRevisionID)
+        XCTAssertThrowsError(try f.orchestrator.send(groupID: group.id, text: "Wrong context"))
+        XCTAssertNil(try f.ctx.botStore.groupWorkspaceID(groupID: group.id))
+        XCTAssertEqual(try room(f, group).map(\.id), [history.id])
+        XCTAssertNil(try memberThread(f, group, f.ana))
+        XCTAssertTrue(f.runner.requests.isEmpty)
+    }
+
+    func test_canonicalEmptyGroupAdoptRPCPreservesIDAndReturnsWorkspaceReadback() async throws {
+        let f = try makeFixture()
+        let group = try await makeGroup(f, bots: [f.ana])
+        let directory = URL(fileURLWithPath: f.support).appendingPathComponent("airtours", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let workspace = try f.router.createWorkspace(name: "Airtours", cwd: directory.path)
+        _ = try f.ctx.botStore.transferBotWorkspace(botID: f.ana.id,
+            hostID: f.ctx.liveActivityHostIdentity.serverId, workspaceID: workspace.id,
+            expectedWorkspaceID: nil, expectedCurrentRevisionID: f.ana.currentRevisionID)
+        let result = try await f.ctx.botTeamGroupService.dispatchRemote(method: "bot.group.workspace.adopt", params: [
+            "client_request_id": .string(UUID().uuidString), "group_id": .string(group.id.value.uuidString),
+            "expected_revision": .number(Double(group.revision)), "workspace_id": .string(workspace.id.value.uuidString),
+        ])
+        let returned = result.objectValue?["readback"]?.objectValue?["group"]?.objectValue
+        XCTAssertEqual(returned?["id"]?.stringValue, group.id.value.uuidString.lowercased())
+        XCTAssertEqual(returned?["workspace_id"]?.stringValue, workspace.id.value.uuidString.lowercased())
+        XCTAssertEqual(try f.ctx.botStore.group(id: group.id)?.roomThreadID, group.roomThreadID)
+        XCTAssertTrue(try f.ctx.messageRepo.list(threadId: group.roomThreadID).isEmpty)
+    }
+
+    func test_emptyGroupWorkspaceAdoptionRefusesInMemoryRoomRunBeforeDurableEvidenceExists() async throws {
+        let f = try makeFixture()
+        let group = try await makeGroup(f, bots: [f.ana])
+        let directory = URL(fileURLWithPath: f.support).appendingPathComponent("airtours", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let workspace = try f.router.createWorkspace(name: "Airtours", cwd: directory.path)
+        _ = try f.ctx.botStore.transferBotWorkspace(botID: f.ana.id,
+            hostID: f.ctx.liveActivityHostIdentity.serverId, workspaceID: workspace.id,
+            expectedWorkspaceID: nil, expectedCurrentRevisionID: f.ana.currentRevisionID)
+        f.ctx.coordinator.bindActiveThreadForTesting(threadId: group.roomThreadID, runId: AgentRunID())
+        XCTAssertTrue(try f.ctx.messageRepo.list(threadId: group.roomThreadID).isEmpty)
+        XCTAssertThrowsError(try f.orchestrator.adoptWorkspace(groupID: group.id,
+            expectedRevision: group.revision, workspaceID: workspace.id))
+        XCTAssertNil(try f.ctx.botStore.groupWorkspaceID(groupID: group.id))
+        XCTAssertEqual(try f.ctx.botStore.group(id: group.id)?.revision, group.revision)
+    }
+
+    func test_retryOfHistoricalGeneralTurnCannotLaunchWorkspaceExclusiveBotWithoutContext() async throws {
+        let f = try makeFixture()
+        let group = try await makeGroup(f, bots: [f.ana])
+        let turn = BotGroupTurn(groupID: group.id, roundID: BotGroupRoundID(), botID: f.ana.id,
+            ordinal: 1, state: .failed, error: "Previous launch failed")
+        try f.ctx.botStore.insertGroupTurns([turn])
+        let directory = URL(fileURLWithPath: f.support).appendingPathComponent("airtours", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let workspace = try f.router.createWorkspace(name: "Airtours", cwd: directory.path)
+        _ = try f.ctx.botStore.transferBotWorkspace(botID: f.ana.id,
+            hostID: f.ctx.liveActivityHostIdentity.serverId, workspaceID: workspace.id,
+            expectedWorkspaceID: nil, expectedCurrentRevisionID: f.ana.currentRevisionID)
+        _ = try f.orchestrator.retry(turnID: turn.id, groupID: group.id)
+        let refused = await waitUntil { (try? f.ctx.botStore.groupTurn(id: turn.id)?.state) == .failed }
+        XCTAssertTrue(refused)
+        XCTAssertTrue(f.runner.requests.isEmpty)
+        XCTAssertNil(try memberThread(f, group, f.ana))
+        XCTAssertNil(try f.ctx.botStore.groupWorkspaceID(groupID: group.id))
+    }
+
     // MARK: - Plan A guest
 
     func test_aDistillBotOnItsVMAnswersInsideItsGuest() async throws {

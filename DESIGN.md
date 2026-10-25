@@ -178,3 +178,15 @@ Every screen must work at any window width, from the narrowest the window allows
 - Duplicate lookalikes to merge: settings `settingRow` vs keybindings `settingRow` vs scheduled `formRow`; `statusPill` (Activity) vs `runStatusPill` (Scheduled); `DistillAccountsPanel` add/rename sheets do not use `AgentChoiceSheet`.
 - Error surfaces differ (inline strip in Bots, alerts in Activity and Scheduled) → prefer inline.
 - `DS.NS` lacks `surfaceOverlay`, `hover`, `pressed`, `selection`, `focusRing`, `ultracode`.
+
+## Bot chat presentation (2026-10-24)
+
+Opening a bot is chat-first: the central conversation gets the available width.
+History lives in the main sidebar; a separate thread rail and desktop/inspector
+are optional via labeled header buttons. The first upgrade to this presentation
+closes the two old panes once, retaining drafts, conversation selection and saved
+widths; later explicit visibility choices persist. New conversation remains in
+the header and sidebar rather than a floating button over transcript content.
+Full access uses the shared compact status strip with an accessible details
+popover and direct switch-to-supervised action. Actual failures and approval
+requests stay visible; compact presentation never changes execution permission.

@@ -15996,31 +15996,11 @@ public struct AgentAppView: View {
         }
     }
 
-    // Persistent, prominent banner while full access is on, beyond the small
-    // permission pill in the composer footer (UX-MAC_AGENT-004).
+    // Shared compact status keeps permission and downgrade control discoverable.
     private var fullAccessBanner: some View {
-        HStack(spacing: DS.Space.sm) {
-            Image(systemName: "exclamationmark.shield.fill")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundColor(DS.Palette.danger)
-            VStack(alignment: .leading, spacing: 1) {
-                Text("Full access is on")
-                    .font(DS.Font.caption.weight(.semibold))
-                    .foregroundColor(DS.Palette.danger)
-                Text(Self.fullAccessScopeDescription)
-                    .font(DS.Font.caption2)
-                    .foregroundColor(DS.Palette.textSecondary)
-            }
-            Spacer(minLength: 0)
-            Button("Switch to supervised") { vm.setPermissionMode(.supervised) }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
+        AgentPermissionStatusBar(scopeDescription: Self.fullAccessScopeDescription) {
+            vm.setPermissionMode(.supervised)
         }
-        .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.sm)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(DS.Palette.danger.opacity(0.12))
-        .overlay(alignment: .bottom) { Rectangle().fill(DS.Palette.danger.opacity(0.3)).frame(height: 1) }
-        .accessibilityIdentifier("agent.fullAccessBanner")
     }
 
     // UX-XPLAT-DELETE-UNDO: transient toast offering to restore a just-deleted

@@ -401,6 +401,14 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         if environment[AgentSkillInstaller.computerUseHostAdmissionEnvironmentKey] == "1" {
             servers[ComputerUseMCPAdmit.serverName] = ComputerUseMCPAdmit.stdioConfig(command: resolved)
         }
+        servers[ConnectionMCPCatalog.serverName] = ConnectionsMCPAdmit.claudeCLI(command: resolved, environment: environment)
+        // This entire JSON enters argv. Keep SDK input exact, but make every CLI
+        // managed server resolve its context from the current process environment.
+        for (name, value) in servers {
+            guard var config = value as? [String: Any], let env = config["env"] as? [String: String] else { continue }
+            config["env"] = Dictionary(uniqueKeysWithValues: env.keys.map { ($0, "${" + $0 + "}") })
+            servers[name] = config
+        }
         let object: [String: Any] = ["mcpServers": servers]
         guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
               let json = String(data: data, encoding: .utf8) else {

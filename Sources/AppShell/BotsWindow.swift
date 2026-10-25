@@ -3662,14 +3662,14 @@ public final class BotsViewModel: ObservableObject {
         didSet { persistStudioTab() }
     }
     /// Whole Desk side pane (Desktop row + inspector) is collapsible.
-    @Published public var isDeskSidePaneVisible: Bool = true {
+    @Published public var isDeskSidePaneVisible: Bool = false {
         didSet { persistDeskSidePane() }
     }
     @Published public var deskSidePaneWidth: CGFloat = BotsChrome.desktopPaneWidth {
         didSet { persistDeskSidePaneWidth() }
     }
     /// Dest thread rail is collapsible. Desk header always keeps the toggle.
-    @Published public var isDeskThreadRailVisible: Bool = true {
+    @Published public var isDeskThreadRailVisible: Bool = false {
         didSet { persistDeskThreadRail() }
     }
     @Published public var deskThreadRailWidth: CGFloat = BotsChrome.threadRailWidth {
@@ -4169,6 +4169,7 @@ public final class BotsViewModel: ObservableObject {
         restoreStudioTabIfNeeded()
         restoreShowHiddenIfNeeded()
         restoreBrainPaneIfNeeded()
+        BotChatPresentationPreferences.migrateIfNeeded(in: .standard)
         restoreDeskSidePaneIfNeeded()
         restoreDeskSidePaneWidthIfNeeded()
         restoreDeskThreadRailIfNeeded()
@@ -14651,16 +14652,6 @@ public struct BotsRootView: View {
         }
     }
 
-    /// Floating + on the chat column, so a new conversation starts while the
-    /// THREADS rail is hidden. Same action and copy as the header and rail +.
-    /// Accent, bottom-trailing above the composer; scroll-to-latest stacks on
-    /// top of it, so the two never overlap.
-    private var deskNewThreadFAB: some View {
-        AgentChatNewThreadFAB(identifier: "bots.desk.thread.new.fab") {
-            vm.createDeskThread()
-        }
-    }
-
     /// Visual gap between Desk header glyphs. DSIconButton lays out at
     /// 44pt so the 26pt icon can keep a 44pt hit box; subtract that extra
     /// so the glyphs sit `DS.Space.xs` apart like workspace header icons.
@@ -14672,16 +14663,16 @@ public struct BotsRootView: View {
     /// Desk is chat, so this stays a 44pt chrome strip.
     private func deskHeader(_ bot: BotDefinition) -> some View {
         HStack(spacing: DS.Space.md) {
-            DSIconButton(
-                "sidebar.left",
-                help: vm.isDeskThreadRailVisible
-                    ? AgentChatThreadRailCopy.hideHelp
-                    : AgentChatThreadRailCopy.showHelp
-            ) {
+            Button {
                 withAnimation(reduceMotion ? nil : DS.Motion.standard) {
                     vm.isDeskThreadRailVisible.toggle()
                 }
+            } label: {
+                Label("History", systemImage: "text.bubble")
+                    .font(DS.Font.caption)
             }
+            .buttonStyle(.borderless)
+            .help(vm.isDeskThreadRailVisible ? AgentChatThreadRailCopy.hideHelp : AgentChatThreadRailCopy.showHelp)
             .accessibilityIdentifier("bots.desk.thread.toggle")
             Button {
                 vm.openStudio(bot)
@@ -14749,16 +14740,18 @@ public struct BotsRootView: View {
                     vm.createDeskThread()
                 }
                 .accessibilityIdentifier("bots.desk.thread.new.header")
-                DSIconButton(
-                    "sidebar.right",
-                    help: vm.isDeskSidePaneVisible ? "Hide inspector" : "Show inspector"
-                ) {
+            }
+            Button {
                     withAnimation(reduceMotion ? nil : DS.Motion.standard) {
                         vm.isDeskSidePaneVisible.toggle()
                     }
+                } label: {
+                    Label("Details", systemImage: "sidebar.right")
+                        .font(DS.Font.caption)
                 }
+                .buttonStyle(.borderless)
+                .help(vm.isDeskSidePaneVisible ? "Hide inspector" : "Show inspector")
                 .accessibilityIdentifier("bots.desk.inspectorToggle")
-            }
         }
         .padding(.leading, BotsViewModel.deskIdentityLeadingPadding(
             shellSidebarCollapsed: vm.isShellSidebarCollapsed
@@ -14786,8 +14779,7 @@ public struct BotsRootView: View {
                             showsThreadRail: false,
                             showsHeader: false,
                             showsPlanSidebar: false
-                        ),
-                        timelineAccessory: AnyView(deskNewThreadFAB)
+                        )
                     )
                     .id(agentVM.selectedThreadId)
                 } else if let conversation = vm.selectedConversation,
@@ -14864,11 +14856,6 @@ public struct BotsRootView: View {
                 // message exists, so the column must not say it does not.
                 Spacer(minLength: 0)
             }
-            // Same corner as the linked thread's transcript accessory.
-            deskNewThreadFAB
-                .padding(.trailing, 14)
-                .padding(.bottom, AgentChatTimelineScrollChrome.scrollDownButtonBottomInset)
-                .frame(maxWidth: .infinity, alignment: .trailing)
             AgentChatComposerBar(
                 text: $vm.composerText,
                 attachments: vm.attachments,

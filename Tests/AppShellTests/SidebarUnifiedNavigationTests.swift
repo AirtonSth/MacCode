@@ -95,6 +95,41 @@ final class SidebarUnifiedNavigationTests: XCTestCase {
         XCTAssertFalse(after.contains(sendOnly.id), "a General grant without read is not a General Bot row")
     }
 
+    func test_workspaceGroupRoomAndMembersNeverBecomeOrdinaryConversationRows() async throws {
+        let f = try make("workspace-group-plumbing")
+        defer { try? FileManager.default.removeItem(atPath: f.directory) }
+        let workspace = try f.router.createWorkspace(name: "Group project", cwd: NSTemporaryDirectory())
+        let bot = try f.context.botStore.create(name: "Group bot", title: "", description: "", workspaceID: workspace.id)
+        let other = try f.context.botStore.create(name: "Legacy group bot", title: "", description: "", workspaceID: workspace.id)
+        let group = try await f.context.botTeamGroupService.createGroup(title: "Canonical room", participantBotIDs: [bot.id, other.id])
+        XCTAssertEqual(try f.context.threadRepo.get(id: group.roomThreadID)?.workspaceId, workspace.id)
+        let grant = try XCTUnwrap(try f.context.botStore.getContextBinding(hostID: f.host, botID: bot.id, context: .workspace(workspace.id)))
+        let memberThread = AgentThread(workspaceId: workspace.id, title: "Pinned group member", provider: .codex, model: "fixture")
+        var member = try f.context.botStore.bindWorkspaceGroupMemberThread(groupID: group.id, botID: bot.id,
+            newThread: memberThread, hostID: f.host, policyRevision: grant.policyRevision,
+            destination: f.context.botStore.executionDestination(botID: bot.id))
+        // Group identity must exclude private plumbing even if its hidden flag changes.
+        member.hidden = false
+        try f.context.botStore.upsertConversation(member)
+        let legacyThread = try f.router.createAgentThread(workspace: workspace.id, title: "Unpinned group member",
+            provider: .codex, model: "fixture", permissionMode: .supervised, reasoningEffort: .medium)
+        var legacy = try XCTUnwrap(try f.context.botStore.listGroupMemberConversations(groupID: group.id).first { $0.botID == other.id })
+        legacy.linkedAgentThreadID = legacyThread.id
+        legacy.hidden = false
+        try f.context.botStore.upsertConversation(legacy)
+        let plain = try f.router.createAgentThread(workspace: workspace.id, title: "Ordinary work", provider: .codex,
+            model: "fixture", permissionMode: .supervised, reasoningEffort: .medium)
+        f.vm.reload()
+        await expand(f.vm, workspace.id)
+        XCTAssertEqual(f.vm.workspaceConversationRows(workspace.id).map(\.threadID), [plain.id],
+            "Only ordinary work may enter the workspace's generic AgentApp navigation/send surface")
+        let groups = BotTeamsGroupsController(context: f.context, routerProvider: { f.router })
+        groups.reload()
+        XCTAssertTrue(groups.groups.contains { $0.id == group.id }, "The first-class group remains visible")
+        groups.selectGroup(group.id)
+        XCTAssertEqual(groups.selectedGroup?.roomThreadID, group.roomThreadID, "Canonical group navigation keeps the original room")
+    }
+
     func test_conversationsHideRevokedAndForeignPinnedBotThreadsButKeepPlainWork() async throws {
         let f = try make("conversation-authority")
         defer { try? FileManager.default.removeItem(atPath: f.directory) }

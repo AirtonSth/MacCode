@@ -74,6 +74,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     public var onHasLiveRun: ((BotID) -> Bool)?
     public var onStopRun: ((BotID, String?, String?, String?, Bool, String) -> Void)?
     public var onContextBindingChanged: ((BotContextBinding) -> Bool)?
+    public var onWorkspaceAssignmentChanged: (() -> Void)?
+    public var workspaceAssignmentHostID: (() -> String?)?
     public var onStartGuest: ((BotID, String, String, [String: Any]) -> Void)?
     public var onStopGuest: ((BotID, String, [String: Any]) -> Void)?
     public var onRebuildGuest: ((BotID, String, [String: Any]) -> Void)?
@@ -1341,6 +1343,55 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 
     private func perform(name: String, params: [String: Any], requestID: String, now: Date) throws -> [String: Any] {
         switch name {
+        case "workspace.transfer", "vm.transfer":
+            try requireControlPlane()
+            let fields: Set<String> = name == "workspace.transfer"
+                ? ["client_request_id", "bot_id", "host_id", "workspace_id", "expected_workspace_id", "expected_current_revision_id", "revoke_other_contexts"]
+                : ["client_request_id", "vm_id", "workspace_id", "expected_workspace_id"]
+            guard Set(params.keys).isSubset(of: fields), params.keys.contains("workspace_id"),
+                  params.keys.contains("expected_workspace_id") else { throw Error.invalidParams }
+            let destination = try virtualMachineWorkspace(params)
+            let expected: WorkspaceID?
+            if params["expected_workspace_id"] is NSNull { expected = nil }
+            else {
+                guard let raw = string(params, "expected_workspace_id"), let id = UUID(uuidString: raw) else { throw Error.invalidParams }
+                expected = WorkspaceID(id)
+            }
+            do {
+                let readback: [String: Any]
+                let changedBot: String?
+                let live: (BotID) -> Bool = { [self] botID in
+                    (onHasLiveRun?(botID) ?? false) || liveRuns[botID.value.uuidString.lowercased()] != nil
+                }
+                if name == "workspace.transfer" {
+                    let bot = try requireBot(params)
+                    guard let host = string(params, "host_id"), host == workspaceAssignmentHostID?(),
+                          let raw = string(params, "expected_current_revision_id"), let revision = UUID(uuidString: raw),
+                          params["revoke_other_contexts"] == nil || params["revoke_other_contexts"] is Bool else { throw Error.invalidParams }
+                    let transferred = try store.transferBotWorkspace(botID: bot.id, hostID: host,
+                        workspaceID: destination, expectedWorkspaceID: expected,
+                        expectedCurrentRevisionID: BotRevisionID(revision),
+                        revokeOtherContexts: params["revoke_other_contexts"] as? Bool ?? false,
+                        computerControl: computerControl, hasLiveRun: live)
+                    var cleanupRequested = true
+                    for binding in transferred.changedBindings {
+                        cleanupRequested = (onContextBindingChanged?(binding) ?? false) && cleanupRequested
+                    }
+                    var encoded = try encodeBot(transferred.bot)
+                    encoded["access_cleanup_requested"] = cleanupRequested
+                    readback = encoded
+                    changedBot = id(bot)
+                } else {
+                    guard let raw = string(params, "vm_id"), let vmID = UUID(uuidString: raw) else { throw Error.invalidParams }
+                    let transferred = try store.transferVirtualMachineWorkspace(id: vmID, workspaceID: destination,
+                        expectedWorkspaceID: expected, hostID: workspaceAssignmentHostID?(), computerControl: computerControl, hasLiveRun: live)
+                    readback = encodeVirtualMachine(transferred)
+                    changedBot = nil
+                }
+                onWorkspaceAssignmentChanged?()
+                return receipt(requestID: requestID, status: .completed, botID: changedBot, readback: readback)
+            } catch let error as Error { throw error }
+            catch { throw Error(code: -32602, message: error.localizedDescription) }
         case "vm.save":
             try requireControlPlane()
             let workspaceID = try virtualMachineWorkspace(params)
@@ -3134,7 +3185,9 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             throw Error.guestConflict
         }
         if take {
-            computerControl.take(bot.id)
+            guard computerControl.take(bot.id) else {
+                throw Error(code: -32092, message: "This computer is being moved. Try taking control after the move finishes.")
+            }
         } else {
             computerControl.release(bot.id)
         }

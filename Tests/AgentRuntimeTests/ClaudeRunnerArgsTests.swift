@@ -92,7 +92,8 @@ final class ClaudeRunnerArgsTests: XCTestCase {
             let servers = try XCTUnwrap(root["mcpServers"] as? [String: Any])
             let server = try XCTUnwrap(servers[BotSelfConfigMCPAdmit.serverName] as? [String: Any])
             let forwarded = try XCTUnwrap(server["env"] as? [String: String])
-            XCTAssertEqual(forwarded, environment.filter { $0.key != "UNRELATED_SECRET" })
+            let expected = Dictionary(uniqueKeysWithValues: environment.keys.filter { $0 != "UNRELATED_SECRET" }.map { ($0, "${" + $0 + "}") })
+            XCTAssertEqual(forwarded, expected)
             XCTAssertNil(forwarded["UNRELATED_SECRET"])
             XCTAssertFalse(args[args.index(after: index)].contains(request.prompt))
             XCTAssertFalse(args.contains("--strict-mcp-config"),

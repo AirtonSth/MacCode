@@ -8,6 +8,11 @@ public extension BotStore {
             throw BotStoreError.invalidInput("hostID must be nonempty")
         }
         return try db.transaction {
+            try grantContextWithinTransaction(hostID: hostID, botID: botID, context: context, actions: actions, expectedRevision: expectedRevision)
+        }
+    }
+
+    internal func grantContextWithinTransaction(hostID: String, botID: BotID, context: BotContext, actions: Set<BotContextAction>, expectedRevision: Int64?) throws -> BotContextBinding {
             let raw = try db.prepare("SELECT 1 FROM bot_context_bindings WHERE host_id=? AND bot_id=? AND context_key=?;")
             try raw.bind(1, hostID)
             try raw.bind(2, botID.value.uuidString.lowercased())
@@ -37,11 +42,15 @@ public extension BotStore {
             try write.bind(6, encoded)
             _ = try write.step()
             return BotContextBinding(hostID: hostID, botID: botID, context: context, state: .active, policyRevision: revision, actions: actions)
-        }
     }
 
     func revokeContext(hostID: String, botID: BotID, context: BotContext, expectedRevision: Int64) throws -> BotContextBinding {
         try db.transaction {
+            try revokeContextWithinTransaction(hostID: hostID, botID: botID, context: context, expectedRevision: expectedRevision)
+        }
+    }
+
+    internal func revokeContextWithinTransaction(hostID: String, botID: BotID, context: BotContext, expectedRevision: Int64) throws -> BotContextBinding {
             guard let old = try contextBinding(hostID: hostID, botID: botID, context: context), old.policyRevision == expectedRevision, old.policyRevision < Int64.max else { throw BotStoreError.revisionConflict }
             let revision = old.policyRevision + 1
             let update = try db.prepare("UPDATE bot_context_bindings SET state='revoked', policy_revision=? WHERE host_id=? AND bot_id=? AND context_key=?;")
@@ -51,7 +60,6 @@ public extension BotStore {
             try update.bind(4, context.storageKey)
             _ = try update.step()
             return BotContextBinding(hostID: hostID, botID: botID, context: context, state: .revoked, policyRevision: revision, actions: old.actions)
-        }
     }
 
     func getContextBinding(hostID: String, botID: BotID, context: BotContext) throws -> BotContextBinding? {

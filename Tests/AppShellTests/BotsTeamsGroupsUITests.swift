@@ -19,6 +19,7 @@ final class BotsTeamsGroupsUITests: XCTestCase {
         "bots.screen", "bots.selectedBotID", "bots.searchText", "bots.showHidden",
         BotTeamsGroupsController.selectedGroupDefaultsKey,
         BotTeamsGroupsController.inspectorDefaultsKey,
+        BotTeamsGroupsController.sidebarExpansionDefaultsKey,
     ]
 
     override class func setUp() {
@@ -123,6 +124,65 @@ final class BotsTeamsGroupsUITests: XCTestCase {
             BotRosterSections.make(roster: bots, teams: [], membersByTeam: [:]),
             "no teams must mean no sections: the roster renders exactly as before"
         )
+    }
+
+    func test_sidebarGroupsFilterHiddenSearchParticipantsAndSortPinnedThenRecent() {
+        let ana = BotDefinition(handle: "ana", name: "Ana", title: "", description: "")
+        let recent = BotGroupConversation(title: "Recent", roomThreadID: AgentThreadID(), updatedAt: Date(timeIntervalSince1970: 20))
+        let pinned = BotGroupConversation(title: "Pinned", roomThreadID: AgentThreadID(), pinned: true, updatedAt: Date(timeIntervalSince1970: 1))
+        let hidden = BotGroupConversation(title: "Hidden", roomThreadID: AgentThreadID(), hidden: true)
+        let participants = [recent.id: [BotGroupParticipant(groupID: recent.id, botID: ana.id, memberConversationID: BotConversationID(), sortOrder: 0, joinedAt: Date())]]
+        XCTAssertEqual(BotSidebarGroups.visible([recent, hidden, pinned], showHidden: false, query: "", participants: participants, roster: [ana]).map(\.id), [pinned.id, recent.id])
+        XCTAssertEqual(BotSidebarGroups.visible([recent, hidden, pinned], showHidden: true, query: "Hidden", participants: participants, roster: [ana]).map(\.id), [hidden.id])
+        XCTAssertEqual(BotSidebarGroups.visible([recent, pinned], showHidden: false, query: "ANA", participants: participants, roster: [ana]).map(\.id), [recent.id])
+    }
+
+    func test_sidebarHistoryLoadsOnlyExpandedBotsAndNeverGroupMemberConversations() async throws {
+        let f = try makeFixture()
+        _ = try await makeGroup(f, bots: [f.ana, f.bob])
+        let ordinary = BotConversation(botID: f.ana.id, title: "Ordinary")
+        let other = BotConversation(botID: f.bob.id, title: "Other bot")
+        try f.ctx.botStore.upsertConversation(ordinary)
+        try f.ctx.botStore.upsertConversation(other)
+        let vm = makeViewModel(f)
+        let controller = vm.teamsGroups
+        controller.toggleSidebarExpansion("bot:" + f.ana.id.value.uuidString)
+        await controller.settleReloadForTesting()
+        XCTAssertEqual(controller.sidebarConversations[f.ana.id]?.map(\.conversation.id), [ordinary.id])
+        XCTAssertNil(controller.sidebarConversations[f.bob.id])
+        // Collapse A and expand B before A's refresh can return: latest expansion wins.
+        controller.toggleSidebarExpansion("bot:" + f.ana.id.value.uuidString)
+        controller.toggleSidebarExpansion("bot:" + f.bob.id.value.uuidString)
+        await controller.settleReloadForTesting()
+        XCTAssertNil(controller.sidebarConversations[f.ana.id])
+        XCTAssertEqual(controller.sidebarConversations[f.bob.id]?.map(\.conversation.id), [other.id])
+        XCTAssertNil(controller.sidebarLoadError)
+    }
+
+    func test_groupInspectorStartsClosedAndRestoresLaterExplicitChoices() throws {
+        let f = try makeFixture()
+        let controller = BotTeamsGroupsController(context: f.ctx, routerProvider: { f.router })
+        XCTAssertFalse(controller.isInspectorVisible)
+        controller.isInspectorVisible = true
+        let reopened = BotTeamsGroupsController(context: f.ctx, routerProvider: { f.router })
+        XCTAssertTrue(reopened.isInspectorVisible)
+        reopened.isInspectorVisible = false
+        let closedAgain = BotTeamsGroupsController(context: f.ctx, routerProvider: { f.router })
+        XCTAssertFalse(closedAgain.isInspectorVisible)
+    }
+
+    func test_sidebarExpansionPersistsWithoutChangingTeamMembershipOrGroupSelection() async throws {
+        let f = try makeFixture()
+        let group = try await makeGroup(f, bots: [f.ana])
+        let vm = makeViewModel(f)
+        vm.openGroup(group.id)
+        vm.teamsGroups.toggleSidebarExpansion("bot:" + f.ana.id.value.uuidString)
+        vm.teamsGroups.toggleSidebarExpansion("team:example")
+        let reopened = BotTeamsGroupsController(context: f.ctx, routerProvider: { f.router })
+        XCTAssertEqual(reopened.sidebarExpandedKeys, vm.teamsGroups.sidebarExpandedKeys)
+        XCTAssertEqual(reopened.selectedGroupID, group.id)
+        vm.teamsGroups.toggleSidebarExpansion("bot:" + f.ana.id.value.uuidString)
+        XCTAssertFalse(vm.teamsGroups.sidebarExpandedKeys.contains("bot:" + f.ana.id.value.uuidString))
     }
 
     func test_aBotInTwoTeamsShowsUnderEach_andOtherBotsHoldsTheRest() {

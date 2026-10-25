@@ -18,6 +18,7 @@ final class BotTeamGroupService {
         "bot.team.create", "bot.team.update", "bot.team.set_members", "bot.team.delete", "bot.team.reorder",
         "bot.group.create", "bot.group.update", "bot.group.set_participants", "bot.group.send",
         "bot.group.stop", "bot.group.retry_turn", "bot.group.select", "bot.group.delete",
+        "bot.group.workspace.adopt",
     ]
 
     static func handles(_ method: String) -> Bool {
@@ -32,6 +33,7 @@ final class BotTeamGroupService {
         "bot.team.create", "bot.team.update", "bot.team.set_members", "bot.team.reorder",
         "bot.group.create", "bot.group.update", "bot.group.set_participants", "bot.group.send",
         "bot.group.retry_turn",
+        "bot.group.workspace.adopt",
     ]
     /// Same code and text as `BotRemoteControlAuthority.Error.controlPlaneOff`.
     static let controlPlaneOffCode = -32081
@@ -183,9 +185,11 @@ final class BotTeamGroupService {
     /// and their running turn in this group stops.
     @discardableResult
     func setGroupParticipants(id: BotGroupID, expectedRevision: Int, botIDs: [BotID]) throws -> BotGroupConversation {
+        try orchestrator.validateParticipants(groupID: id, botIDs: botIDs)
         let before = Set(try botStore.listGroupParticipants(groupID: id).map(\.botID))
         let pending = try botStore.listGroupTurns(groupID: id, states: BotGroupTurn.State.pending)
-        let group = try botStore.setGroupParticipants(id: id, expectedRevision: expectedRevision, botIDs: botIDs)
+        guard let hostID = orchestrator.workspaceHostID else { throw BotStoreError.notFound }
+        let group = try botStore.setGroupParticipants(id: id, expectedRevision: expectedRevision, botIDs: botIDs, hostID: hostID)
         let removed = before.subtracting(botIDs)
         if !removed.isEmpty {
             orchestrator.participantsWereRemoved(
@@ -205,7 +209,10 @@ final class BotTeamGroupService {
         attachments: [AgentAttachment] = []
     ) throws -> BotGroupOrchestrator.SendReceipt {
         guard !deletingGroups.contains(groupID) else { throw BotGroupOrchestrator.SendError.rejected(Self.deletingMessage) }
-        return try orchestrator.send(groupID: groupID, text: text, submitKey: submitKey, attachments: attachments)
+        let before = try botStore.group(id: groupID)?.revision
+        let receipt = try orchestrator.send(groupID: groupID, text: text, submitKey: submitKey, attachments: attachments)
+        if let group = try botStore.group(id: groupID), group.revision != before { publishGroup("updated", group: group) }
+        return receipt
     }
 
     @discardableResult
@@ -398,6 +405,13 @@ final class BotTeamGroupService {
 
     private func mutate(method: String, params: [String: JSONValue]) async throws -> [String: JSONValue] {
         switch method {
+        case "bot.group.workspace.adopt":
+            let group = try orchestrator.adoptWorkspace(
+                groupID: BotGroupID(try Self.requiredUUID(params, "group_id")),
+                expectedRevision: try Self.requiredInt(params, "expected_revision"),
+                workspaceID: WorkspaceID(try Self.requiredUUID(params, "workspace_id")))
+            publishGroup("updated", group: group)
+            return ["group": try groupRow(group)]
         case "bot.team.create":
             let team = try createTeam(
                 name: params["name"]?.stringValue ?? "",
@@ -560,6 +574,7 @@ final class BotTeamGroupService {
             "unread": .bool(group.unread),
             "attention_state": .string(Self.wireAttention(group.attentionState)),
             "revision": .number(Double(group.revision)),
+            "workspace_id": try botStore.groupWorkspaceID(groupID: group.id).map { .string(Self.key($0.value)) } ?? .null,
             "participants": .array(ordered.map { participant in
                 let threadID = threads[participant.memberConversationID] ?? nil
                 let route = route(threadID)

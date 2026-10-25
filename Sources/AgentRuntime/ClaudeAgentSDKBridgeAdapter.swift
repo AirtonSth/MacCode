@@ -1774,6 +1774,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         if environment[AgentSkillInstaller.computerUseHostAdmissionEnvironmentKey] == "1" {
             servers[ComputerUseMCPAdmit.serverName] = ComputerUseMCPAdmit.stdioConfig(command: resolved)
         }
+        servers[ConnectionMCPCatalog.serverName] = ConnectionsMCPAdmit.stdio(command: resolved, environment: environment)
         return servers
     }
 

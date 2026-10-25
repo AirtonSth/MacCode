@@ -200,6 +200,7 @@ extension BotStore {
         leadBotID: BotID? = nil,
         maxAutoHops: Int = BotGroupConversation.defaultMaxAutoHops,
         participantBotIDs: [BotID],
+        hostID: String? = nil,
         now: Date = Date()
     ) throws -> BotGroupConversation {
         let title = try Self.requiredName(title, what: "Group title")
@@ -219,6 +220,15 @@ extension BotStore {
             try Self.validate(group, participants: participants)
             if let teamID, try loadTeam(id: teamID, database: db) == nil {
                 throw BotStoreError.notFound
+            }
+            if let hostID {
+                guard let room = try AgentThreadRepository(db: db).get(id: roomThreadID) else { throw BotStoreError.notFound }
+                if let workspace = room.workspaceId {
+                    try validateGroupWorkspaceBindings(botIDs: participants, hostID: hostID,
+                        workspaceID: workspace, grantMissingOwned: true)
+                } else if try proposedGroupWorkspace(botIDs: participants) != nil {
+                    throw BotStoreError.invalidInput("Workspace bots need a group in their workspace.")
+                }
             }
             let insert = try db.prepare("""
                 INSERT INTO bot_group_conversations(
@@ -337,11 +347,16 @@ extension BotStore {
         id: BotGroupID,
         expectedRevision: Int,
         botIDs: [BotID],
+        hostID: String? = nil,
         now: Date = Date()
     ) throws -> BotGroupConversation {
         try db.transaction {
             guard var group = try loadGroup(id: id, database: db) else { throw BotStoreError.notFound }
             guard group.revision == expectedRevision else { throw BotStoreError.revisionConflict }
+            if let hostID, let workspace = try groupWorkspaceID(groupID: id) {
+                try validateGroupWorkspaceBindings(botIDs: botIDs, hostID: hostID,
+                    workspaceID: workspace, grantMissingOwned: true)
+            }
             let wanted = try liveBotIDs(botIDs, database: db)
             if let lead = group.leadBotID, !wanted.contains(lead) {
                 guard group.policy != .lead else {

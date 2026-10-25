@@ -29,6 +29,7 @@ const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity 
 let queue = [];
 let waiters = [];
 let activeQuery = null;
+const queryManagedIdentities = new WeakMap();
 let awaitingPlanReviewInterrupt = false;
 let bridgeConfigured = false;
 let handshakePublished = false;
@@ -286,6 +287,7 @@ function ensureQuery() {
       },
     },
   });
+  queryManagedIdentities.set(activeQuery, managedIdentity(current.env));
   (async () => {
     try {
       for await (const message of activeQuery) {
@@ -350,12 +352,57 @@ function ensureQuery() {
   return activeQuery;
 }
 
+// The pinned SDK serializes stdio MCP options into its CLI argv. The host IPC
+// payload keeps exact per-turn context; only this final SDK boundary uses refs.
+const MANAGED_MCP_SERVERS = new Set([
+  'remotecode-bot-self-config', 'remotecode-bot-browser',
+  'remotecode-bot-computer', 'remotecode-bot-web',
+  'remotecode-computer-use', 'rc-connections',
+]);
+
+const MANAGED_IDENTITY_KEYS = [
+  'RC_REMOTE_CODE_BOT_ID', 'RC_REMOTE_CODE_SUBAGENT_THREAD_ID',
+  'RC_REMOTE_CODE_ROOT_RUN_ID', 'RC_REMOTE_CODE_AGENT_APP_SOCKET_PATH',
+  'RC_REMOTE_CODE_DELEGATION_CAPABILITY', 'RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY',
+];
+function managedIdentity(environment) {
+  return Object.fromEntries(MANAGED_IDENTITY_KEYS.map(key => [key, environment?.[key]]));
+}
+function changesManagedIdentity(command) {
+  if (!activeQuery) return false;
+  const identity = queryManagedIdentities.get(activeQuery);
+  if (!identity) return true;
+  const differs = environment => environment && typeof environment === 'object'
+    && MANAGED_IDENTITY_KEYS.some(key => Object.prototype.hasOwnProperty.call(environment, key)
+      && environment[key] !== identity[key]);
+  // Check explicit turn env independently: old MCP overrides must not mask a new capability.
+  if (differs(command.environment) || differs(command.env)) return true;
+  const servers = command.mcp_servers || current.mcpServers || {};
+  return Object.entries(servers).some(([name, server]) => MANAGED_MCP_SERVERS.has(name)
+    && differs(server?.env));
+}
+
 function configuredMcpServers() {
   const configured = current.mcpServers && typeof current.mcpServers === 'object'
     ? current.mcpServers
     : {};
+  const safe = {};
+  for (const [name, server] of Object.entries(configured)) {
+    if (!MANAGED_MCP_SERVERS.has(name) || !server || typeof server !== 'object'
+        || server.type === 'sdk' || !server.env || typeof server.env !== 'object') {
+      safe[name] = server;
+      continue;
+    }
+    const references = {};
+    for (const [key, value] of Object.entries(server.env)) {
+      if (typeof value !== 'string') continue;
+      current.env[key] = value;
+      references[key] = '${' + key + '}';
+    }
+    safe[name] = { ...server, env: references };
+  }
   const e2e = e2eUserInputMcpServers() || {};
-  const merged = { ...configured, ...e2e };
+  const merged = { ...safe, ...e2e };
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
@@ -550,6 +597,13 @@ for await (const line of rl) {
   } else if (command.type === 'rc_turn') {
     if (!bridgeConfigured) {
       emit({ type: 'sdk_error', message: 'Claude Agent SDK bridge rejected turn before a valid rc_configure handshake' });
+      continue;
+    }
+    // Native coordinator recycles SDK sessions on a fresh run capability. A resident
+    // SDK child has immutable env; reject unsupported identity changes before any
+    // shared state can attribute old-query events to the incoming turn.
+    if (changesManagedIdentity(command)) {
+      emit({ type: 'sdk_error', message: 'Managed host identity changed. Start a new provider session before sending another turn.' });
       continue;
     }
     if (!handshakePublished) {

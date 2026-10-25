@@ -8802,14 +8802,16 @@ final class BotsWindowTests: XCTestCase {
         // must come back hidden.
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
-        XCTAssertTrue(vm.isDeskThreadRailVisible)
-        vm.isDeskThreadRailVisible = false
+        vm.isDeskThreadRailVisible = true
+        let reopenedVisible = BotsViewModel(context: context)
+        XCTAssertTrue(reopenedVisible.isDeskThreadRailVisible)
+        reopenedVisible.isDeskThreadRailVisible = false
         let restored = BotsViewModel(context: context)
         XCTAssertFalse(restored.isDeskThreadRailVisible)
     }
 
     func test_createDeskThreadKeepsRailAndInspectorHidden_becausePlusMustNotOpenSidebars() throws {
-        // WHY: the header + and the FAB exist so the user can start a thread
+        // WHY: the header and sidebar commands let the user start a thread
         // without opening the THREADS column. Forcing it open also overwrote
         // the saved hide choice, so the next launch came back with it shown.
         let context = try makeContext()
@@ -8855,58 +8857,10 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
-    func test_deskNewThreadFABSitsOnTheChatColumn_becauseAHiddenRailMustNotHideIt() throws {
-        // WHY: the user keeps the THREADS rail hidden. A + inside the rail
-        // would never show; the FAB lives on the chat column, outside the
-        // rail branch, and runs the same action and copy as the other +.
-        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
-        let fabStart = try XCTUnwrap(source.range(of: "private var deskNewThreadFAB: some View {"))
-        let fabRest = source[fabStart.upperBound...]
-        let fabEnd = fabRest.range(of: "\n    private ")?.lowerBound ?? fabRest.endIndex
-        let fab = String(source[fabStart.lowerBound..<fabEnd])
-        XCTAssertTrue(fab.contains("vm.createDeskThread()"), "one action for every +")
-        XCTAssertTrue(fab.contains("bots.desk.thread.new.fab"))
-        XCTAssertTrue(fab.contains("AgentChatNewThreadFAB("), "the Agent App and the desk share one FAB")
-        XCTAssertFalse(fab.contains("isDeskThreadRailVisible"), "the FAB must not touch panel visibility")
-
-        let chatStart = try XCTUnwrap(source.range(of: "private func deskChat"))
-        let chatRest = source[chatStart.upperBound...]
-        let chatEnd = chatRest.range(of: "\n    private func deskUnlinkedComposer")?.lowerBound ?? chatRest.endIndex
-        let chat = String(source[chatStart.lowerBound..<chatEnd])
-        // The owner asked for it blue, bottom-right just above the composer:
-        // the transcript's trailing accessory slot, where scroll-to-latest
-        // stacks on top of it instead of overlapping it.
-        let shared = try String(contentsOf: sourceURL("Sources/Surfaces/AgentChatNewThreadFAB.swift"), encoding: .utf8)
-        XCTAssertTrue(shared.contains("DS.Palette.accent"), "the FAB is the accent (blue) action")
-        let mount = try XCTUnwrap(
-            chat.range(of: "timelineAccessory: AnyView(deskNewThreadFAB)"),
-            "the linked chat mounts the FAB in the transcript's bottom-trailing slot"
-        )
-        let railBranch = try XCTUnwrap(chat.range(of: "deskThreadRail\n"))
-        let inspector = try XCTUnwrap(chat.range(of: "if vm.isDeskSidePaneVisible"))
-        XCTAssertLessThan(railBranch.lowerBound, mount.lowerBound, "mounted on the chat column, after the rail branch")
-        XCTAssertLessThan(mount.lowerBound, inspector.lowerBound, "not inside the inspector branch")
-        XCTAssertFalse(chat.contains(".overlay(alignment: .trailing) {\n                deskNewThreadFAB"),
-                       "no mid-column float over the transcript")
-
-        let unlinkedStart = try XCTUnwrap(source.range(of: "private func deskUnlinkedComposer"))
-        let unlinkedRest = source[unlinkedStart.upperBound...]
-        let composer = try XCTUnwrap(unlinkedRest.range(of: "AgentChatComposerBar("))
-        XCTAssertTrue(String(unlinkedRest[..<composer.lowerBound]).contains("deskNewThreadFAB"),
-                      "a thread with no run yet keeps the FAB in the same corner, above its composer")
-
-        let chrome = try String(contentsOf: sourceURL("Sources/Surfaces/AgentChatTimelineChrome.swift"), encoding: .utf8)
-        let scrollDown = try XCTUnwrap(chrome.range(of: "accessibilityIdentifier(scrollToBottomIdentifier)"))
-        let accessory = try XCTUnwrap(chrome.range(of: "if let trailingAccessory {"))
-        XCTAssertLessThan(scrollDown.lowerBound, accessory.lowerBound,
-                          "scroll-to-latest stacks above the accessory in the same corner")
-
-        let rail = try XCTUnwrap(source.range(of: "private var deskThreadRail: some View {"))
-        let railRest = source[rail.upperBound...]
-        let railEnd = railRest.range(of: "\n    private ")?.lowerBound ?? railRest.endIndex
-        XCTAssertFalse(String(source[rail.lowerBound..<railEnd]).contains("deskNewThreadFAB"),
-                       "inside the rail it would vanish with the rail")
-    }
+    // The old FAB/source-layout assertion was superseded by chat-first presentation.
+    // New-conversation commands remain in the header and bot sidebar menus;
+    // pane migration and explicit-choice persistence have behavior coverage in
+    // BotChatPresentationPreferencesTests and native layout QA.
 
     func test_clearAllDeskThreadsDeletesOnlyThatBot_becauseClearAllMustNotWipeTheFleet() throws {
         // WHY: dest Clear All is this teammate's dest list, not every bot

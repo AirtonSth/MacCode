@@ -246,12 +246,12 @@ public enum RemoteAccessStatus: Equatable {
 
 /// Left-column destinations of the in-app Settings layout.
 public enum SettingsCategory: String, CaseIterable, Identifiable {
-    case remoteAccess, accounts, fileAccess, computerUse, diff, terminal, sidebar, pet, insomnia,
+    case remoteAccess, accounts, connections, fileAccess, computerUse, diff, terminal, sidebar, pet, insomnia,
          bots, keybindings, storage, customModels, devices, notifications, diagnostics
 
     /// Rows rendered as separate groups, in order.
     public static let groups: [[SettingsCategory]] = [
-        [.remoteAccess, .accounts, .devices, .notifications],
+        [.remoteAccess, .accounts, .connections, .devices, .notifications],
         [.fileAccess, .computerUse, .bots, .customModels],
         [.terminal, .diff, .sidebar, .keybindings],
         [.pet, .insomnia],
@@ -265,6 +265,7 @@ public enum SettingsCategory: String, CaseIterable, Identifiable {
     public var title: String {
         switch self {
         case .remoteAccess: return "Remote Access"
+        case .connections: return "Connections"
         case .accounts: return "Accounts & Auto"
         case .fileAccess: return "File Access"
         case .computerUse: return "Computer Use"
@@ -286,6 +287,7 @@ public enum SettingsCategory: String, CaseIterable, Identifiable {
     public var subtitle: String {
         switch self {
         case .remoteAccess: return "Let paired iPhones and other devices reach this Mac over the network."
+        case .connections: return "Connect services once to MacCode and control access across all models."
         case .accounts: return "Connect the accounts Distill uses and choose how Auto picks between them."
         case .fileAccess: return "Choose which folders and disks MacCode agents can read and write."
         case .computerUse: return "Connect the Chrome extension and manage computer-use access for agents."
@@ -307,6 +309,7 @@ public enum SettingsCategory: String, CaseIterable, Identifiable {
     public var symbol: String {
         switch self {
         case .remoteAccess: return "antenna.radiowaves.left.and.right"
+        case .connections: return "puzzlepiece.extension"
         case .accounts: return "person.crop.circle.badge.checkmark"
         case .fileAccess: return "folder.badge.gearshape"
         case .computerUse: return "cursorarrow.rays"
@@ -327,7 +330,7 @@ public enum SettingsCategory: String, CaseIterable, Identifiable {
 
     public var tint: Color {
         switch self {
-        case .remoteAccess, .fileAccess, .sidebar, .storage, .devices, .notifications: return DS.Palette.accent
+        case .remoteAccess, .connections, .fileAccess, .sidebar, .storage, .devices, .notifications: return DS.Palette.accent
         case .accounts, .insomnia, .customModels: return DS.Palette.ultracode
         case .computerUse, .bots: return DS.Palette.success
         case .diff, .pet: return DS.Palette.warning
@@ -1727,6 +1730,8 @@ public struct SettingsView: View {
             )
             .background(routeAnchor(.accounts))
             .accessibilityIdentifier("settings.section.accounts")
+        case .connections: ConnectionsSettingsSection(context: vm.context)
+            .accessibilityIdentifier("settings.section.connections")
         case .fileAccess: hostFileAccessSection
         case .computerUse: ChromeExtensionSettingsSection()
         case .diff: diffDefaultsSection

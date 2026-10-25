@@ -933,7 +933,7 @@ public final class JSONRPCDispatcher {
     @TaskLocal private static var managedProviderSocketAuthenticated = false
     private nonisolated static let managedProviderSocketMethods =
         RemoteCodeHostCatalog.rpcMethods.union([
-            "bot.peer.list", "bot.peer.ask", "bot.peer.self_config", "bot.peer.status", "bot.peer.cancel",
+            "bot.peer.list", "bot.peer.ask", "bot.peer.self_config", "bot.peer.status", "bot.peer.cancel", ConnectionMCPCatalog.rpcMethod,
             "bot.peer.receipt.status",
         ])
     nonisolated static let managedPeerReceiptMethods: Set<String> = [
@@ -1067,7 +1067,7 @@ public final class JSONRPCDispatcher {
         "bot.notice.read",
         "bot.notice.clear",
         "bot.desktop.set",
-        "bot.vm.save",
+        "bot.vm.save", "bot.workspace.transfer", "bot.vm.transfer",
         "bot.execution.set",
         "bot.avatar.set",
         "bot.handle.set",
@@ -1082,7 +1082,7 @@ public final class JSONRPCDispatcher {
         "bot.team.delete",
         "bot.team.reorder",
         "bot.group.create",
-        "bot.group.update",
+        "bot.group.update", "bot.group.workspace.adopt",
         "bot.group.set_participants",
         "bot.group.send",
         "bot.group.stop",
@@ -1823,6 +1823,7 @@ public final class JSONRPCDispatcher {
             || req.method == "bot.peer.status"
             || req.method == "bot.peer.cancel"
             || req.method == "bot.peer.self_config"
+            || req.method == ConnectionMCPCatalog.rpcMethod
             || isPeerReceiptStatus
         let isHost = RemoteCodeHostCatalog.rpcMethods.contains(req.method)
         guard isPeer || isHost else {
@@ -3632,6 +3633,12 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: encode(s))
             case "token_saver.digest.get":
                 return .init(id: id, result: router.tokenSaverDigest() ?? .object([:]))
+            case ConnectionMCPCatalog.rpcMethod:
+                guard let handler = router as? ConnectionCommandRouting,
+                      let threadID = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
+                      let runID = params["run_id"]?.stringValue.flatMap(UUID.init).map(AgentRunID.init),
+                      let message = params["message"]?.objectValue else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: try await handler.connectionMCP(message: message, threadID: threadID, runID: runID, capability: params[BotPeerDelegation.capabilityRPCParameterKey]?.stringValue))
             case "bot.peer.list":
                 guard let threadID = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
                       let runID = params["run_id"]?.stringValue.flatMap(UUID.init).map(AgentRunID.init) else {

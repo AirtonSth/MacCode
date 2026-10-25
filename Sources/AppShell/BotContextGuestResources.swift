@@ -153,7 +153,7 @@ final class BotContextGuestResources {
                     resources.container = try service.provision(contextBinding: binding, workspace: workspace, registeredWorkspaces: registeredWorkspaces, requestingThreadID: request.threadId, virtualMachineID: identity.virtualMachineID).containerID
                     guard authorize() else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
                     let run = request.runId.value.uuidString.lowercased()
-                    let issued = try gateway.issue(.init(runID: run, hostEnvironment: [:], context: context))
+                    let issued = try gateway.issue(.init(runID: run, hostEnvironment: BotGuestMCPGateway.Binding.hostEnvironment(fromRunEnvironment: request.environment), context: context))
                     resources.installationAttempted = true
                     resources.networkLease = try service.installGatewayLease(identity: identity, runID: request.runId, port: issued.port)
                     let parent = try PrivateDirectory(home, create: false)
@@ -174,6 +174,7 @@ final class BotContextGuestResources {
                     resources.configDirectory = directory
                     let rendered = DistillGuestConfig.render(hostConfig: providerConfiguration, gatewayPort: issued.port, servers: [
                         .init(name: BotSelfConfigCatalog.serverName, toolTimeoutSeconds: 900),
+                        .init(name: ConnectionMCPCatalog.serverName, toolTimeoutSeconds: 60),
                     ], hostEnvironment: [:])
                     guard rendered.droppedModels[request.model] == nil else {
                         throw BotComputerGuestServiceError.contextualRuntimeUnavailable

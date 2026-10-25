@@ -110,6 +110,8 @@ public final class AppContext {
 
     public let channel: ReleaseChannel
     public let db: SQLiteDB
+    /// App-owned tool connections are independent of the selected agent provider.
+    public lazy var connectionBroker = ConnectionBroker(store: ConnectionStore(db: db))
     /// Readonly WAL connection for UI chrome reads (PF-30).
     public let readDB: SQLiteDB
     public let bootstrapReport: BootstrapReport

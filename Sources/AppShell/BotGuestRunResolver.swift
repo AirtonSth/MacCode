@@ -221,6 +221,15 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
         if let holder = deps.registry.tryBegin(botID: admission.pin.botID, entry: claim, resourceID: identity.storageBotID) {
             throw DistillGuestLaunchError.busy("The VM is busy in \(holder.title)")
         }
+        // A catalog move can finish after the first check and before this claim.
+        // Once claimed it cannot move again; reject a stale authority/runtime now.
+        do {
+            guard admission.validates(),
+                  try deps.botStore.contextRuntimeIdentity(pin: admission.pin, threadID: request.threadId) == identity else { throw unavailable }
+        } catch {
+            deps.registry.endRun(runID: request.runId)
+            throw error
+        }
         let lease = try await deps.leases.acquire(identity.storageBotID.value.uuidString.lowercased())
         var resources: BotContextGuestResources?
         var heartbeat: BotGuestLeaseHeartbeat?
@@ -315,7 +324,7 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
             destination, botID: botID, workspaceID: thread.workspaceId,
             contextPin: deps.botStore.conversationContextPin(linkedTo: thread.id)
         )
-        let machine = try destination.virtualMachineID.flatMap { try deps.botStore.virtualMachine(id: $0) }
+        var machine = try destination.virtualMachineID.flatMap { try deps.botStore.virtualMachine(id: $0) }
         if let workspaceID = machine?.workspaceID, await deps.workspaces()[workspaceID] == nil {
             throw DistillGuestLaunchError.unavailable("This VM's workspace is no longer available.")
         }
@@ -332,6 +341,17 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
         if let holder = deps.registry.tryBegin(botID: botID, entry: claim, resourceID: resourceID,
                                               allowsSameThreadExclusive: false) {
             throw DistillGuestLaunchError.busy("The VM is busy in \(holder.title)")
+        }
+        do {
+            try deps.botStore.validateExecutionDestination(destination, botID: botID, workspaceID: thread.workspaceId,
+                contextPin: deps.botStore.conversationContextPin(linkedTo: thread.id))
+            guard try deps.botStore.guestResourceID(botID: botID, threadID: thread.id) == resourceID else {
+                throw DistillGuestLaunchError.unavailable("The computer assignment changed. Start the conversation again.")
+            }
+            machine = try destination.virtualMachineID.flatMap { try deps.botStore.virtualMachine(id: $0) }
+        } catch {
+            deps.registry.endRun(runID: request.runId)
+            throw error
         }
         // Failed preparation leaves release to the coordinator. A prepared
         // delegated run keeps its exclusive claim until guest termination

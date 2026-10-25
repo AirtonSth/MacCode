@@ -696,9 +696,9 @@ public final class GrokACPClient: @unchecked Sendable {
             )
             : withWeb
         guard environment[AgentSkillInstaller.computerUseHostAdmissionEnvironmentKey] == "1" else {
-            return withComputer
+            return ConnectionsMCPAdmit.acp(existing: withComputer, command: resolved, environment: environment)
         }
-        return ComputerUseMCPAdmit.admitGrokACP(existing: withComputer, command: resolved)
+        return ConnectionsMCPAdmit.acp(existing: ComputerUseMCPAdmit.admitGrokACP(existing: withComputer, command: resolved), command: resolved, environment: environment)
     }
 
     /// ACP `session/new` cwd must be an existing absolute path. Empty or

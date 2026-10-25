@@ -36,6 +36,22 @@ public final class BotVMRunRegistry: @unchecked Sendable {
     private var waiting: [BotID: [Waiter]] = [:]
     public init() {}
 
+    /// Reserves all affected runtime namespaces together. A workspace move must
+    /// never slip between a run's destination validation and resource claim.
+    /// Waiting work is refused rather than stopped or silently redirected.
+    public func withWorkspaceMaintenance<T>(resourceIDs: Set<BotID>, _ body: () throws -> T) throws -> T {
+        let maintenance = Entry(threadID: AgentThreadID(), runID: AgentRunID(),
+            title: "Workspace assignment", workspace: "", exclusive: true)
+        try lock.withLock {
+            guard resourceIDs.allSatisfy({ (claims[$0] ?? []).isEmpty && (waiting[$0] ?? []).isEmpty }) else {
+                throw BotWorkspaceMaintenanceError.busy
+            }
+            for resource in resourceIDs { claims[resource] = [maintenance] }
+        }
+        defer { endRun(runID: maintenance.runID) }
+        return try body()
+    }
+
     /// Claims the VM for `entry`; returns the other thread's claim in the way.
     /// A run is kept out only by an exclusive claim; an exclusive claim by any
     /// claim of another thread (its own thread's agent may rebuild mid-run).
@@ -156,5 +172,12 @@ public final class BotVMRunRegistry: @unchecked Sendable {
 
     public func busyMessage(botID: BotID, threadID: AgentThreadID, resourceID: BotID? = nil) -> String? {
         blocker(botID: botID, threadID: threadID, resourceID: resourceID).map { "The VM is busy in \($0.title)" }
+    }
+}
+
+public enum BotWorkspaceMaintenanceError: Error, LocalizedError {
+    case busy
+    public var errorDescription: String? {
+        "A conversation is running, starting or waiting on this resource. Finish it before moving the resource."
     }
 }

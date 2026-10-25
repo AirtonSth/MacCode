@@ -390,7 +390,11 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             arguments.contains { $0.contains("mcp_servers.\(name).command=") }
         }
         let hasScopedBotID = { (name: String) in
-            arguments.contains { $0.contains("mcp_servers.\(name).env.\(BotSelfConfigCatalog.callerEnvironmentKey)=") }
+            arguments.contains {
+                $0.contains("mcp_servers.\(name).env.\(BotSelfConfigCatalog.callerEnvironmentKey)=")
+                    || ($0.hasPrefix("mcp_servers.\(name).env_vars=")
+                        && $0.contains("\"\(BotSelfConfigCatalog.callerEnvironmentKey)\""))
+            }
         }
         var overrides: [String] = []
         if names.contains(where: { !hasManagedCommand($0) || (callerIsScoped && !hasScopedBotID($0)) }) {

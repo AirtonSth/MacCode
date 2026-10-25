@@ -132,4 +132,68 @@ final class ManualActionRequestStoreTests: XCTestCase {
         XCTAssertEqual(store.all(threadID: thread).first?.state, .continued)
         XCTAssertNil(try store.take(id: UUID()))
     }
+
+    func test_maintenanceDenialRestoresOpenRequestAndAllowsLaterTake() throws {
+        let dir = makeDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = ManualActionRequestStore(appSupportDirectory: dir)
+        let bot = BotID(), resource = BotID(), thread = AgentThreadID()
+        let request = ManualActionRequest(botID: bot, threadID: thread, kind: .login, reason: "Sign in")
+        try store.upsert(request)
+        let control = BotComputerControl()
+        control.configureResourceLookup { _, _ in resource }
+        try control.withWorkspaceMaintenance(resourceIDs: [resource], botIDs: [bot]) {
+            XCTAssertThrowsError(try store.take(id: request.id, control: control))
+            XCTAssertEqual(store.open(threadID: thread)?.state, .open)
+            XCTAssertFalse(control.isControlledByUser(bot, resourceID: resource))
+        }
+        XCTAssertEqual(try store.take(id: request.id, control: control)?.state, .taken)
+        XCTAssertTrue(control.isControlledByUser(bot, resourceID: resource))
+    }
+
+    func test_deniedTakeDoesNotReopenRequestResolvedBeforeControlAcquisition() throws {
+        for terminal in [ManualActionState.continued, .declined, .expired] {
+            let dir = makeDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let store = ManualActionRequestStore(appSupportDirectory: dir)
+            let bot = BotID(), resource = BotID(), thread = AgentThreadID()
+            let request = ManualActionRequest(botID: bot, threadID: thread, kind: .login, reason: "Sign in")
+            try store.upsert(request)
+            let control = BotComputerControl()
+            // Resource resolution occurs between the durable take and in-memory
+            // control acquisition, reproducing a terminal arriving in that gap.
+            control.configureResourceLookup { _, _ in
+                _ = try? store.resolve(id: request.id, state: terminal, note: "Already answered")
+                return resource
+            }
+            try control.withWorkspaceMaintenance(resourceIDs: [resource], botIDs: [bot]) {
+                XCTAssertThrowsError(try store.take(id: request.id, control: control))
+            }
+            XCTAssertEqual(store.all(threadID: thread).first?.state, terminal)
+            XCTAssertEqual(store.all(threadID: thread).first?.note, "Already answered")
+        }
+    }
+
+    func test_deniedTakeDoesNotRewriteReplacedRequestGeneration() throws {
+        let dir = makeDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = ManualActionRequestStore(appSupportDirectory: dir)
+        let bot = BotID(), resource = BotID(), thread = AgentThreadID()
+        let request = ManualActionRequest(botID: bot, threadID: thread, kind: .login, reason: "Original")
+        try store.upsert(request)
+        var replacement = request
+        replacement.createdAt = request.createdAt.addingTimeInterval(1)
+        replacement.reason = "Replacement"
+        replacement.state = .taken
+        let replaced = replacement
+        let control = BotComputerControl()
+        control.configureResourceLookup { _, _ in
+            try? store.upsert(replaced)
+            return resource
+        }
+        try control.withWorkspaceMaintenance(resourceIDs: [resource], botIDs: [bot]) {
+            XCTAssertThrowsError(try store.take(id: request.id, control: control))
+        }
+        XCTAssertEqual(store.all(threadID: thread).first, replaced)
+    }
 }

@@ -92,7 +92,18 @@ public final class ManualActionRequestStore: @unchecked Sendable {
     @discardableResult
     public func take(id: UUID, control: BotComputerControl) throws -> ManualActionRequest? {
         guard let taken = try take(id: id) else { return nil }
-        control.take(taken.botID, threadID: taken.threadID)
+        guard control.take(taken.botID, threadID: taken.threadID) else {
+            try lock.withLock {
+                var items = load()
+                // A terminal or a replacement may have arrived after our take.
+                // Restore only the exact still-taken request that we wrote.
+                if let index = items.firstIndex(where: { $0 == taken }) {
+                    items[index].state = .open
+                    try save(items)
+                }
+            }
+            throw BotWorkspaceControlError.inUse
+        }
         return taken
     }
 

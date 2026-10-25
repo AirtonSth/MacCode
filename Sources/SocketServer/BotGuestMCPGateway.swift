@@ -84,6 +84,11 @@ public final class BotGuestMCPGateway: @unchecked Sendable {
     }
 
     public static let defaultRoutes: [Route] = [
+        Route(name: ConnectionMCPCatalog.serverName,
+              allowedTools: Set([ConnectionMCPCatalog.list, ConnectionMCPCatalog.tools, ConnectionMCPCatalog.call]),
+              keepsServerInstructions: true) { environment, line in
+            ManagedConnectionsMCP(environment: environment).handle(line)
+        },
         Route(
             name: BotSelfConfigCatalog.serverName,
             // A saved secret becomes an environment variable of this bot's Mac
@@ -339,6 +344,11 @@ public final class BotGuestMCPGateway: @unchecked Sendable {
 
     private func route(named name: String, binding: Binding) -> Route? {
         guard context != nil else { return routes[name] }
+        if name == ConnectionMCPCatalog.serverName, bindingIsAuthorized(binding) {
+            return Route(name: name, allowedTools: [ConnectionMCPCatalog.list, ConnectionMCPCatalog.tools, ConnectionMCPCatalog.call], keepsServerInstructions: true) { environment, line in
+                ManagedConnectionsMCP(environment: environment).handle(line)
+            }
+        }
         guard name == BotSelfConfigCatalog.serverName,
               let context, let store = contextStore,
               bindingIsAuthorized(binding) else { return nil }

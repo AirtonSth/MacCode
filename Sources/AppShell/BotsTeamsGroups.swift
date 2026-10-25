@@ -39,6 +39,27 @@ struct BotRosterSections: Equatable {
     }
 }
 
+/// Presentation only: the canonical service remains responsible for rooms and read state.
+enum BotSidebarGroups {
+    static func visible(_ groups: [BotGroupConversation], showHidden: Bool, query: String,
+                        participants: [BotGroupID: [BotGroupParticipant]], roster: [BotDefinition]) -> [BotGroupConversation] {
+        let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let bots = Dictionary(roster.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        return groups.filter { group in
+            guard showHidden || !group.hidden else { return false }
+            return query.isEmpty || group.title.localizedCaseInsensitiveContains(query)
+                || (participants[group.id] ?? []).contains { participant in
+                    guard let bot = bots[participant.botID] else { return false }
+                    return bot.name.localizedCaseInsensitiveContains(query) || bot.handle.localizedCaseInsensitiveContains(query)
+                }
+        }.sorted {
+            if $0.pinned != $1.pinned { return $0.pinned }
+            if $0.updatedAt != $1.updatedAt { return $0.updatedAt > $1.updatedAt }
+            return $0.id.value.uuidString < $1.id.value.uuidString
+        }
+    }
+}
+
 // MARK: - Controller
 
 /// Bot teams and group conversations for the Mac Bots UI: the sidebar lists,
@@ -81,7 +102,7 @@ public final class BotTeamsGroupsController: ObservableObject {
     @Published private(set) var selectedGroupID: BotGroupID?
     /// The open group (hidden or not), published with the selection.
     @Published private(set) var selectedGroup: BotGroupConversation?
-    @Published var isInspectorVisible = true {
+    @Published var isInspectorVisible = false {
         didSet { UserDefaults.standard.set(isInspectorVisible, forKey: Self.inspectorDefaultsKey) }
     }
     /// Presented by the Bots shell root: the Teams manager and the group editors.
@@ -94,6 +115,23 @@ public final class BotTeamsGroupsController: ObservableObject {
     /// A participant's private member thread shown in place of the room.
     @Published private(set) var privateThreadBotID: BotID?
     @Published private(set) var privateThreadVM: AgentAppViewModel?
+
+    static let sidebarExpansionDefaultsKey = "bots.sidebar.expanded"
+    @Published private(set) var sidebarExpandedKeys: Set<String> = []
+    struct SidebarConversation: Equatable, Sendable {
+        let conversation: BotConversation
+        let context: BotContext?
+    }
+    @Published private(set) var hasLoadedSidebar = false
+    @Published private(set) var sidebarLoadError: String?
+    @Published private(set) var sidebarConversations: [BotID: [SidebarConversation]] = [:]
+
+    func toggleSidebarExpansion(_ key: String) {
+        if sidebarExpandedKeys.contains(key) { sidebarExpandedKeys.remove(key) }
+        else { sidebarExpandedKeys.insert(key) }
+        UserDefaults.standard.set(sidebarExpandedKeys.sorted(), forKey: Self.sidebarExpansionDefaultsKey)
+        if key.hasPrefix("bot:") { scheduleReload() }
+    }
 
     static let selectedGroupDefaultsKey = "bots.selectedGroupID"
     static let inspectorDefaultsKey = "bots.groupInspector"
@@ -123,6 +161,7 @@ public final class BotTeamsGroupsController: ObservableObject {
         self.context = context
         self.routerProvider = routerProvider
         let defaults = UserDefaults.standard
+        sidebarExpandedKeys = Set(defaults.stringArray(forKey: Self.sidebarExpansionDefaultsKey) ?? [])
         if let raw = defaults.string(forKey: Self.selectedGroupDefaultsKey), let uuid = UUID(uuidString: raw) {
             selectedGroupID = BotGroupID(uuid)
         }
@@ -142,7 +181,7 @@ public final class BotTeamsGroupsController: ObservableObject {
         }
         scheduleReload()
         let subscription = EventBus.shared.subscribeFromCurrent(
-            filter: .kindPrefixes(["bot.team.updated", "bot.group.updated"])
+            filter: .kindPrefixes(["bot.team.updated", "bot.group.updated", "bot.conversation.updated", "bot.updated", "bot.deleted", "bots.attention.changed"])
         ) { [weak self] _ in
             Task { @MainActor [weak self] in self?.scheduleReload() }
         }
@@ -175,12 +214,15 @@ public final class BotTeamsGroupsController: ObservableObject {
         let participants: [BotGroupID: [BotGroupParticipant]]
         let memberThreads: [BotGroupID: [BotID: MemberThread]]
         let retryable: [BotGroupID: [BotGroupTurn]]
+        let sidebarConversations: [BotID: [SidebarConversation]]
     }
 
     private nonisolated static func read(
         _ store: BotStore,
         threads: AgentThreadRepository,
-        selectedGroupID: BotGroupID?
+        selectedGroupID: BotGroupID?,
+        expanded: Set<String>,
+        hostID: String
     ) throws -> Snapshot {
         let groups = try store.listGroups(includeHidden: true)
         var participants: [BotGroupID: [BotGroupParticipant]] = [:]
@@ -203,13 +245,29 @@ public final class BotTeamsGroupsController: ObservableObject {
                 store, groupID: selectedGroupID, active: Set((participants[selectedGroupID] ?? []).map(\.botID))
             )
         }
+        var histories: [BotID: [SidebarConversation]] = [:]
+        for key in expanded where key.hasPrefix("bot:") {
+            guard let uuid = UUID(uuidString: String(key.dropFirst(4))) else { continue }
+            let botID = BotID(uuid)
+            histories[botID] = try store.listConversations(botID: botID).compactMap { conversation in
+                guard conversation.groupID == nil else { return nil }
+                let pin = try store.conversationContextPin(conversationID: conversation.id)
+                if pin != nil, try !store.authorizesConversation(conversation, hostID: hostID, action: .read) { return nil }
+                return SidebarConversation(conversation: conversation, context: pin?.context)
+            }.sorted {
+                if $0.conversation.pinned != $1.conversation.pinned { return $0.conversation.pinned }
+                if $0.conversation.updatedAt != $1.conversation.updatedAt { return $0.conversation.updatedAt > $1.conversation.updatedAt }
+                return $0.conversation.id.value.uuidString < $1.conversation.id.value.uuidString
+            }
+        }
         return Snapshot(
             teams: try store.listTeams(),
             members: try store.listTeamMembers(),
             groups: groups,
             participants: participants,
             memberThreads: memberThreads,
-            retryable: retryable
+            retryable: retryable,
+            sidebarConversations: histories
         )
     }
 
@@ -235,8 +293,10 @@ public final class BotTeamsGroupsController: ObservableObject {
         reloadTask?.cancel()
         reloadTask = nil
         do {
-            apply(try Self.read(botStore, threads: context.threadRepo, selectedGroupID: selectedGroupID))
+            sidebarLoadError = nil
+            apply(try Self.read(botStore, threads: context.threadRepo, selectedGroupID: selectedGroupID, expanded: sidebarExpandedKeys, hostID: context.liveActivityHostIdentity.serverId))
         } catch {
+            sidebarLoadError = Self.message(for: error)
             onError?(Self.message(for: error))
         }
     }
@@ -250,13 +310,22 @@ public final class BotTeamsGroupsController: ObservableObject {
         let store = botStore
         let threads = context.threadRepo
         let selected = selectedGroupID
+        let expanded = sidebarExpandedKeys
+        let hostID = context.liveActivityHostIdentity.serverId
         reloadTask = Task { @MainActor [weak self] in
             let result = await Task.detached(priority: .userInitiated) {
-                Result { try Self.read(store, threads: threads, selectedGroupID: selected) }
+                Result { try Self.read(store, threads: threads, selectedGroupID: selected, expanded: expanded, hostID: hostID) }
             }.value
             guard let self, !Task.isCancelled, generation == self.reloadGeneration else { return }
             self.reloadTask = nil
-            if case .success(let snapshot) = result { self.apply(snapshot) }
+            switch result {
+            case .success(let snapshot):
+                self.sidebarLoadError = nil
+                self.apply(snapshot)
+            case .failure(let error):
+                self.sidebarLoadError = Self.message(for: error)
+                self.onError?(Self.message(for: error))
+            }
         }
     }
 
@@ -267,7 +336,9 @@ public final class BotTeamsGroupsController: ObservableObject {
 
     private func apply(_ snapshot: Snapshot) {
         reloadCountForTesting += 1
+        hasLoadedSidebar = true
         participantsRevision &+= 1
+        if sidebarConversations != snapshot.sidebarConversations { sidebarConversations = snapshot.sidebarConversations }
         if teams != snapshot.teams { teams = snapshot.teams }
         let members = Dictionary(grouping: snapshot.members, by: \.teamID).mapValues { $0.map(\.botID) }
         if membersByTeam != members { membersByTeam = members }
@@ -1304,12 +1375,20 @@ struct BotGroupRoomScreen: View {
                     .help("Stop every bot answering in this group")
                     .accessibilityIdentifier("bots.group.stop")
             }
-            DSIconButton(
-                "sidebar.right",
-                help: teamsGroups.isInspectorVisible ? "Hide inspector" : "Show inspector"
-            ) {
+            Button("Edit") { teamsGroups.roomSheet = .editGroup(group.id) }
+                .buttonStyle(DSSecondaryButtonStyle())
+                .disabled(!vm.isControlPlaneActive)
+                .help("Edit group title and participants")
+                .accessibilityIdentifier("bots.group.edit")
+            Button {
                 withAnimation(reduceMotion ? nil : DS.Motion.standard) { teamsGroups.isInspectorVisible.toggle() }
+            } label: {
+                Label("Details", systemImage: "sidebar.right")
+                    .font(DS.Font.caption)
             }
+            .buttonStyle(DSSecondaryButtonStyle())
+            .help(teamsGroups.isInspectorVisible ? "Hide group details" : "Show group details")
+            .accessibilityValue(teamsGroups.isInspectorVisible ? "Expanded" : "Collapsed")
             .accessibilityIdentifier("bots.group.inspectorToggle")
         }
         .padding(.leading, BotsViewModel.deskIdentityLeadingPadding(shellSidebarCollapsed: vm.isShellSidebarCollapsed))
@@ -1455,5 +1534,233 @@ struct BotGroupInspector: View {
                 .help(threadID == nil ? "\(bot.name) has not answered here yet" : "Show \(bot.name)'s own thread for this group")
                 .accessibilityIdentifier("bots.group.inspector.private.\(bot.handle)")
         }
+    }
+}
+
+/// Main-window group navigation observes the same controller as the room.
+struct SidebarGroupChats: View {
+    @ObservedObject var vm: BotsViewModel
+    @ObservedObject var sidebar: SidebarViewModel
+    @ObservedObject var controller: BotTeamsGroupsController
+    let navigate: (@escaping () -> Void) -> Void
+
+    private var groups: [BotGroupConversation] {
+        let cached = !controller.hasLoadedSidebar && controller.groups.isEmpty ? controller.selectedGroup.map { [$0] } ?? [] : controller.groups
+        return BotSidebarGroups.visible(cached, showHidden: vm.showHidden, query: sidebar.filterText,
+                                 participants: controller.participantsByGroup, roster: vm.bots)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: DS.Space.xxs) {
+            HStack(spacing: DS.Space.sm) {
+                Text("Group chats").font(DS.Font.caption).foregroundColor(DS.Palette.textTertiary)
+                Spacer(minLength: 0)
+                SidebarSectionMoreMenu(help: "Group actions", accessibilityIdentifier: "sidebar.groups.more") {
+                    Button("New group…") { sidebar.beginGroup() }.disabled(!vm.isControlPlaneActive || vm.bots.isEmpty)
+                    Button("Manage teams…") { sidebar.openTeams() }
+                    Toggle("Show hidden", isOn: $vm.showHidden)
+                }
+            }
+            .padding(.horizontal, DS.Space.sm)
+            if !groups.isEmpty {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: DS.Space.xxs) {
+                        ForEach(groups, id: \.id) { group in groupRow(group) }
+                    }
+                }
+                .frame(maxHeight: min(CGFloat(groups.count) * 52, 190))
+            }
+            if let error = controller.sidebarLoadError {
+                Text(error).font(DS.Font.caption).foregroundColor(DS.Palette.warning).padding(.horizontal, DS.Space.sm)
+            }
+            if groups.isEmpty && !controller.hasLoadedSidebar && controller.sidebarLoadError == nil {
+                ProgressView().controlSize(.small).padding(DS.Space.sm).accessibilityLabel("Loading group chats")
+            } else if groups.isEmpty {
+                Text(sidebar.filterText.isEmpty ? "No group chats" : "No matching groups")
+                    .font(DS.Font.caption).foregroundColor(DS.Palette.textTertiary)
+                    .padding(DS.Space.sm)
+            }
+        }
+        .padding(.horizontal, DS.Space.md)
+        .padding(.bottom, DS.Space.lg)
+        .accessibilityIdentifier("sidebar.groups")
+    }
+
+    private func groupRow(_ group: BotGroupConversation) -> some View {
+        let members = controller.bots(in: group.id, from: vm.bots)
+        let selected = sidebar.isBotsSelected && vm.screen == .group && controller.selectedGroupID == group.id
+        return Button { navigate { sidebar.openGroup(group.id) } } label: {
+            HStack(spacing: DS.Space.sm) {
+                BotStackedAvatars(bots: members, size: 20).frame(width: 40, alignment: .leading)
+                VStack(alignment: .leading, spacing: DS.Space.xxs) {
+                    Text(group.title).font(DS.Font.body).foregroundColor(DS.Palette.text).lineLimit(1)
+                    Text(members.map(\.name).joined(separator: ", "))
+                        .font(DS.Font.caption2).foregroundColor(DS.Palette.textTertiary).lineLimit(1)
+                }
+                Spacer(minLength: 0)
+                if group.attentionState == .working {
+                    DSBusySpinner(label: "Running")
+                } else if group.attentionState == .needsAttention {
+                    Image(systemName: "exclamationmark.circle.fill").foregroundColor(DS.Palette.warning)
+                        .accessibilityLabel("Needs attention")
+                }
+                if group.unread || group.attentionState == .unreadActivity {
+                    Circle().fill(DS.Palette.accent).frame(width: DS.Space.sm, height: DS.Space.sm)
+                        .accessibilityLabel("Unread")
+                }
+                if group.pinned { Image(systemName: "pin.fill").foregroundColor(DS.Palette.textTertiary).accessibilityHidden(true) }
+                if group.hidden { Image(systemName: "eye.slash").foregroundColor(DS.Palette.textTertiary).accessibilityHidden(true) }
+            }
+            .font(DS.Font.caption)
+            .padding(.horizontal, DS.Space.sm).padding(.vertical, DS.Space.sm)
+            .background(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous).fill(selected ? DS.Palette.selection : .clear))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain).dsHoverFill(enabled: !selected)
+        .accessibilityLabel(group.title)
+        .accessibilityValue("\(members.map(\.name).joined(separator: ", ")). \(group.attentionState.rawValue). \(group.unread ? "Unread." : "")")
+        .accessibilityAddTraits(selected ? .isSelected : [])
+        .accessibilityIdentifier("sidebar.group.\(group.id.value.uuidString.lowercased())")
+        .contextMenu {
+            Button(group.pinned ? "Unpin" : "Pin") { controller.setPinned(!group.pinned, groupID: group.id) }.disabled(!vm.isControlPlaneActive)
+            Button(group.hidden ? "Unhide" : "Hide") { controller.setHidden(!group.hidden, groupID: group.id) }.disabled(!vm.isControlPlaneActive)
+            Button("Edit group…") { sidebar.editGroup(group.id) }.disabled(!vm.isControlPlaneActive)
+        }
+    }
+}
+
+/// Team headings are organizational; they never change group participants.
+struct SidebarTeamRoster<Row: View>: View {
+    @ObservedObject var controller: BotTeamsGroupsController
+    let rows: [SidebarViewModel.GeneralBotRow]
+    let row: (SidebarViewModel.GeneralBotRow) -> Row
+
+    private var memberIDs: Set<BotID> { Set(controller.membersByTeam.values.flatMap { $0 }) }
+
+    private var contentHeight: CGFloat {
+        var visible = rows
+        var headingCount = 0
+        if !controller.teams.isEmpty {
+            visible = rows.filter { $0.isTitio || $0.pinned || !memberIDs.contains($0.botID) }
+            for team in controller.teams {
+                let members = (controller.membersByTeam[team.id] ?? []).compactMap { id in rows.first { $0.botID == id } }
+                guard !members.isEmpty else { continue }
+                headingCount += 1
+                if controller.sidebarExpandedKeys.contains("team:" + team.id.value.uuidString) { visible += members }
+            }
+        }
+        let histories = visible.reduce(0) { total, row in
+            guard controller.sidebarExpandedKeys.contains("bot:" + row.botID.value.uuidString) else { return total }
+            return total + max(1, controller.sidebarConversations[row.botID]?.count ?? 1)
+        }
+        return min(CGFloat(visible.count) * 38 + CGFloat(headingCount) * 26 + CGFloat(histories) * 30, 260)
+    }
+
+    var body: some View {
+        ScrollView {
+        VStack(alignment: .leading, spacing: DS.Space.xxs) {
+            if controller.teams.isEmpty {
+                ForEach(rows) { row($0) }
+            } else {
+                ForEach(rows.filter { $0.isTitio || $0.pinned }) { row($0) }
+                ForEach(controller.teams, id: \.id) { team in
+                    let members = (controller.membersByTeam[team.id] ?? []).compactMap { id in rows.first { $0.botID == id } }
+                    if !members.isEmpty {
+                        let key = "team:" + team.id.value.uuidString
+                        let expanded = controller.sidebarExpandedKeys.contains(key)
+                        Button { controller.toggleSidebarExpansion(key) } label: {
+                            HStack(spacing: DS.Space.xs) {
+                                Image(systemName: expanded ? "chevron.down" : "chevron.right").accessibilityHidden(true)
+                                Text(team.name).lineLimit(1)
+                                Spacer(minLength: 0)
+                                Text("\(members.count)").monospacedDigit()
+                            }
+                            .font(DS.Font.caption).foregroundColor(DS.Palette.textTertiary)
+                            .padding(.horizontal, DS.Space.sm).frame(minHeight: 24).contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain).accessibilityLabel(team.name)
+                        .accessibilityValue(expanded ? "Expanded" : "Collapsed")
+                        .accessibilityIdentifier("sidebar.team.\(team.id.value.uuidString.lowercased())")
+                        if expanded { ForEach(members) { row($0) } }
+                    }
+                }
+                ForEach(rows.filter { !$0.isTitio && !$0.pinned && !memberIDs.contains($0.botID) }) { row($0) }
+            }
+        }
+        }
+        .frame(maxHeight: contentHeight)
+    }
+}
+
+/// History lives beside its bot, with durable expansion and canonical routing.
+struct SidebarBotHistory<Row: View>: View {
+    @ObservedObject var controller: BotTeamsGroupsController
+    @ObservedObject var sidebar: SidebarViewModel
+    @ObservedObject var vm: BotsViewModel
+    let botID: BotID
+    let context: BotContext
+    let row: Row
+    let navigate: (@escaping () -> Void) -> Void
+
+    private var key: String { "bot:" + botID.value.uuidString }
+    private var expanded: Bool { controller.sidebarExpandedKeys.contains(key) }
+    private var history: [BotTeamsGroupsController.SidebarConversation] {
+        (controller.sidebarConversations[botID] ?? []).filter {
+            ($0.context == context || ($0.context == nil && context == .general))
+                && (vm.showHidden || !$0.conversation.hidden)
+                && (sidebar.filterText.isEmpty || $0.conversation.title.localizedCaseInsensitiveContains(sidebar.filterText))
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: DS.Space.xxs) {
+            HStack(spacing: 0) {
+                Button { controller.toggleSidebarExpansion(key) } label: {
+                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                        .font(DS.Font.caption2).foregroundColor(DS.Palette.textTertiary)
+                        .frame(width: 18, height: 30).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain).accessibilityLabel("Conversation history")
+                .accessibilityValue(expanded ? "Expanded" : "Collapsed")
+                .accessibilityIdentifier("sidebar.botHistory.toggle.\(botID.value.uuidString).\(context.storageKey)")
+                row
+            }
+            if expanded {
+                if let entries = controller.sidebarConversations[botID] {
+                    if history.isEmpty {
+                        Text(entries.isEmpty ? "No conversations" : "No matching conversations")
+                            .font(DS.Font.caption).foregroundColor(DS.Palette.textTertiary).padding(.leading, DS.Space.xxl)
+                    }
+                    ForEach(history, id: \.conversation.id) { entry in
+                        historyRow(entry.conversation)
+                    }
+                } else if let error = controller.sidebarLoadError {
+                    Text(error).font(DS.Font.caption).foregroundColor(DS.Palette.warning).padding(.leading, DS.Space.xxl)
+                } else {
+                    ProgressView().controlSize(.small).padding(.leading, DS.Space.xxl).accessibilityLabel("Loading conversations")
+                }
+            }
+        }
+    }
+
+    private func historyRow(_ conversation: BotConversation) -> some View {
+        let selected = sidebar.isBotsSelected && vm.screen == .desk && vm.selectedConversation?.id == conversation.id
+        let running = conversation.linkedAgentThreadID.map { sidebar.runningThreadIDs.contains($0) } ?? false
+        return Button { navigate { sidebar.openHistory(botID: botID, conversationID: conversation.id) } } label: {
+            HStack(spacing: DS.Space.sm) {
+                Text(conversation.title).lineLimit(1).font(DS.Font.caption).foregroundColor(selected ? DS.Palette.text : DS.Palette.textSecondary)
+                Spacer(minLength: 0)
+                if running { DSBusySpinner(label: "Running") }
+                if conversation.attentionState == .needsAttention { Image(systemName: "exclamationmark.circle.fill").foregroundColor(DS.Palette.warning) }
+                if conversation.unread { Circle().fill(DS.Palette.accent).frame(width: DS.Space.sm, height: DS.Space.sm) }
+                if conversation.pinned { Image(systemName: "pin.fill").foregroundColor(DS.Palette.textTertiary) }
+            }
+            .padding(.leading, DS.Space.xxl).padding(.trailing, DS.Space.sm).frame(minHeight: 28)
+            .background(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous).fill(selected ? DS.Palette.selection : .clear))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain).dsHoverFill(enabled: !selected)
+        .accessibilityLabel(conversation.title).accessibilityAddTraits(selected ? .isSelected : [])
+        .accessibilityIdentifier("sidebar.botHistory.\(conversation.id.value.uuidString.lowercased())")
     }
 }
