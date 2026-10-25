@@ -2,6 +2,14 @@ import XCTest
 @testable import CoreModel
 
 final class BotComputerDockerClientTests: XCTestCase {
+    func test_logsPreserveDiagnosticsAfterATruncatedUTF8Character() throws {
+        // The stderr suffix may begin halfway through a multibyte character.
+        let cli = BotComputerDockerCLI { _ in
+            Data([0x80]) + Data("Xvfb failed to start".utf8)
+        }
+        XCTAssertTrue(try cli.logs(name: "exited-guest", tailLines: 40).contains("Xvfb failed to start"))
+    }
+
     func test_createKeepsTheBotDesktopRestartingAcrossDockerRestarts() throws {
         // WHY: the bot VM is always on; without this policy a Docker or Mac
         // restart leaves the desktop stopped until the next run.

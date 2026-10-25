@@ -48,7 +48,10 @@ RUN set -eu; \
 # (launch-browser.sh), so logins made in the viewer are the bot's session.
 RUN npm install -g @playwright/mcp@0.0.83 && npm cache clean --force
 
+# npm uses HOME before this account exists; useradd preserves an existing
+# directory's owner, so make the image's home writable for the guest user.
 RUN useradd --create-home --home-dir /home/remotecode --shell /bin/bash remotecode \
+    && chown -R remotecode:remotecode /home/remotecode \
     && mkdir -p /opt/remotecode-computer
 
 COPY start.sh /opt/remotecode-computer/start.sh

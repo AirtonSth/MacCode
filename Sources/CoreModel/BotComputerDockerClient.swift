@@ -54,6 +54,12 @@ public enum BotComputerDockerError: Error, Equatable, LocalizedError, CustomStri
     /// A bot_computer_exec command outlived its guest limit (`seconds`, at most
     /// `BotComputerGuestSpec.execGuestDeadlineSeconds`) and was stopped.
     case guestCommandTimedOut(seconds: Int)
+    /// The container stopped running while the guest screen was still being
+    /// proved (`waitForPNG` exhausted its attempts and a follow-up inspect
+    /// found it not running). `detail` is the tail of `docker logs`, when one
+    /// could be read, so the real crash reason — not just the generic
+    /// provisioning message — reaches `lastReason` in the UI.
+    case guestCrashed(detail: String)
 
     public var recovery: BotComputerDockerRecovery {
         switch self {
@@ -62,17 +68,23 @@ public enum BotComputerDockerError: Error, Equatable, LocalizedError, CustomStri
         case .probeTimedOut: return .retryTimedOutProbe
         case .outputTooLarge: return .retryProvisioning
         case .networkAddressPoolExhausted, .networkSubnetUnavailable, .provisioningFailed,
-             .guestCommandTimedOut:
+             .guestCommandTimedOut, .guestCrashed:
             return .retryProvisioning
         }
     }
 
     public var description: String {
-        guard case .guestCommandTimedOut(let seconds) = self else { return recovery.message }
-        // The desktop is fine; the agent needs to know its command was stopped.
-        return "The command ran longer than \(seconds) s "
-            + "inside the Linux container and was stopped. Run long jobs in the background "
-            + "(nohup <command> > /tmp/job.log 2>&1 &) and check the log in later calls."
+        if case .guestCommandTimedOut(let seconds) = self {
+            // The desktop is fine; the agent needs to know its command was stopped.
+            return "The command ran longer than \(seconds) s "
+                + "inside the Linux container and was stopped. Run long jobs in the background "
+                + "(nohup <command> > /tmp/job.log 2>&1 &) and check the log in later calls."
+        }
+        if case .guestCrashed(let detail) = self {
+            let message = "\(recovery.message) The Linux desktop container exited while starting up."
+            return detail.isEmpty ? message : "\(message) Last log lines:\n\(detail)"
+        }
+        return recovery.message
     }
     public var errorDescription: String? { description }
 }
@@ -107,6 +119,7 @@ public protocol BotComputerDockerClienting: Sendable {
     func remove(name: String) throws
     func removeMatching(namePrefix: String) throws
     func top(name: String) throws -> String
+    func logs(name: String, tailLines: Int) throws -> String
 }
 
 public extension BotComputerDockerClienting {
@@ -119,6 +132,10 @@ public extension BotComputerDockerClienting {
     }
 
     func top(name: String) throws -> String { "" }
+
+    /// Best-effort diagnostic only; a conformer that cannot fetch logs
+    /// answers "" rather than failing the caller that wants them.
+    func logs(name: String, tailLines: Int) throws -> String { "" }
 
     /// One Docker call per fact, and only the labels RemoteCode stamps on its
     /// images. `BotComputerDockerCLI` reads everything in one call instead.
@@ -481,6 +498,11 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
         String(data: try run(["top", name]), encoding: .utf8) ?? ""
     }
 
+    public func logs(name: String, tailLines: Int) throws -> String {
+        let data = try run(["logs", "--tail", "\(max(1, tailLines))", name])
+        return String(decoding: data, as: UTF8.self)
+    }
+
     public func removeMatching(namePrefix: String) throws {
         let data = try run(["ps", "-aq", "--filter", "name=\(namePrefix)"])
         let names = (String(data: data, encoding: .utf8) ?? "")
@@ -525,9 +547,13 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
                 return printed
             }
             BotComputerDockerResolver.shared.invalidateIfMatches(executable)
-            throw failureError(for: args, stderr: result.errorData)
+            let failure = failureError(for: args, stderr: result.errorData)
+            logFailure(args: args, status: result.terminationStatus, stderr: result.errorData, mapped: failure)
+            throw failure
         }
-        return result.data
+        // Non-TTY Docker containers keep their stdout and stderr separate,
+        // even for successful `docker logs`. Both carry startup diagnostics.
+        return args.first == "logs" ? result.data + result.errorData : result.data
     }
 
     /// An inspect of several images prints the ones that exist and exits
@@ -549,6 +575,20 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
             }
         }
         return args.first == "info" ? .daemonUnavailable : .provisioningFailed
+    }
+
+    /// Every mapped error above collapses to one of a few fixed messages for
+    /// the UI; the Docker CLI's own stderr is the only place the real cause
+    /// (image pull failure, container crash, disk space, ...) survives. Log
+    /// it so `log stream --predicate 'category == "bot-computer-docker"'`
+    /// can show it without changing what the user sees.
+    static func logFailure(args: [String], status: Int32, stderr: Data, mapped: BotComputerDockerError) {
+        let detail = String(decoding: stderr, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .prefix(4_096)
+        botComputerDockerLog.error(
+            "docker.failed args=\(args.first ?? "?", privacy: .public) status=\(status, privacy: .public) mapped=\(String(describing: mapped), privacy: .public) stderr=\(detail, privacy: .private)"
+        )
     }
 
     static func timeoutForArguments(_ args: [String]) -> TimeInterval {

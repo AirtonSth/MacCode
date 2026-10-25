@@ -247,7 +247,7 @@ public final class AppContext {
                     // A bot.delete RPC may be capturing events for its receipt;
                     // these settle later and must publish on their own.
                     EventBus.outsideMutationCapture {
-                        Task { @MainActor [weak self] in
+                        _ = Task { @MainActor [weak self] in
                             self?.botTeamGroupService.botWasDeleted(botID, cancelledTurnIDs: cancelledTurnIDs)
                         }
                     }

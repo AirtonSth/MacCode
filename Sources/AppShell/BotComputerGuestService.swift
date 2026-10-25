@@ -72,6 +72,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
         "Dockerfile": [
             "28da84d0e980c6862d74f1a55c4010e9e450ca718ea3931e19e02b5c7a781ef5",
             "f76708fdeadee4b8c2b970e6bcb0d1cf0143ed57331d14a14941406fbc438bb6", // revision 4
+            "5a88684d00a666ede90652c0732610a493ace9a52833ff6fb62cf76a24923e51", // revision 7, root-owned home
         ],
         "start.sh": [
             "3ee4664d5865f5316a2cf5b0bb8550dbe893d952c6ef71d4ae82f78d6451d840",
@@ -1051,12 +1052,29 @@ public final class BotComputerGuestService: @unchecked Sendable {
                 lastError = error
             } catch {
                 lastError = error
-                if attempt + 1 < observeAttempts {
-                    sleep(observeDelay)
-                }
+            }
+            // Every transient failure needs the same boot grace, including
+            // the DockerError thrown by a real `docker exec import` failure.
+            if attempt + 1 < observeAttempts {
+                sleep(observeDelay)
             }
         }
-        throw lastError
+        throw enrichedIfCrashed(lastError, name: name)
+    }
+
+    /// `lastError` from an exhausted `waitForPNG` is usually just "the
+    /// screenshot command failed again," which collapses to the same fixed
+    /// `.provisioningFailed` message regardless of cause. One extra inspect
+    /// tells the two apart: still booting (keep `lastError`, the UI's normal
+    /// "retry" story) vs. the container actually exited (surface the real
+    /// crash reason from `docker logs` instead of hiding it).
+    private func enrichedIfCrashed(_ lastError: Error, name: String) -> Error {
+        guard let inspected = try? docker.inspect(name: name), !inspected.running else {
+            return lastError
+        }
+        let tail = (try? docker.logs(name: name, tailLines: 40))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return BotComputerDockerError.guestCrashed(detail: String(tail.suffix(4_096)))
     }
 
     private func readyState(name: String, botID: BotID, resumed: Bool, contextualNetworkPolicy: Bool = false) throws -> BotComputerGuestReady {

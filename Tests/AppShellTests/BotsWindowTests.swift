@@ -12535,6 +12535,33 @@ final class BotsWindowTests: XCTestCase {
         }
     }
 
+    func test_stoppingDesktopDiscardsDisconnectedViewerBeforeSameURLResume() async throws {
+        // noVNC stays disconnected when the same URL is reused after Stop/Start.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let other = try vm.create(name: "Vera", title: "Scout", provider: .claude)
+        let fake = RecordingDocker()
+        vm.computerGuestService = BotComputerGuestService(
+            appSupport: context.appSupportDirectory, docker: fake,
+            observeAttempts: 1, observeDelay: 0
+        )
+        let url = try XCTUnwrap(URL(string: "http://127.0.0.1:49152/vnc.html"))
+        vm.rememberGuestScreen(url: url, botID: bot.id, running: true)
+        vm.rememberGuestScreen(url: url, botID: other.id, running: true)
+        let stopped = expectation(description: "desktop stopped")
+        vm.stopDockerGuest(botID: bot.id) { success in
+            XCTAssertTrue(success)
+            stopped.fulfill()
+        }
+        await fulfillment(of: [stopped], timeout: 10)
+        XCTAssertFalse(vm.isGuestRunning(bot.id))
+        XCTAssertNil(vm.guestScreenURL(for: bot.id))
+        XCTAssertEqual(vm.guestScreenURL(for: other.id), url)
+        vm.rememberGuestScreen(url: url, botID: bot.id, running: true)
+        XCTAssertEqual(vm.guestScreenURL(for: bot.id), url)
+    }
+
     func test_BotComputerDocker_stopDoesNotBlockMainActor() async throws {
         let context = try makeContext()
         let vm = BotsViewModel(context: context)

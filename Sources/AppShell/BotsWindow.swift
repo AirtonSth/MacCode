@@ -13049,6 +13049,13 @@ public final class BotsViewModel: ObservableObject {
                 try await BotsViewModel.runDockerBlocking { try service.stop(botID: resourceID) }
                 await MainActor.run {
                     self.guestRunningByBot[resourceID.value] = false
+                    // Dispose the disconnected noVNC page so a same-URL resume
+                    // mounts a fresh viewer and performs its autoconnect again.
+                    self.guestScreenURLByBot[resourceID.value] = nil
+                    if let selectedBotID = self.selectedBotID,
+                       (try? self.guestDisplayResourceID(selectedBotID)) == resourceID {
+                        self.lastGuestScreenURL = nil
+                    }
                     self.guestLaunchStateByBot[resourceID.value] = .idle
                     self.objectWillChange.send()
                     onSettled?(true)

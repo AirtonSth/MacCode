@@ -22,6 +22,10 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
     var execCalls = 0
     var execFailuresRemaining = 0
     var execError: Error?
+    var execFailure: Error = BotComputerGuestError.observeFailed
+    var exitsOnScreenshot = false
+    var logText = ""
+    var logError: Error?
     var bootstrapOutput = Data("context-network-policy-v1\n".utf8)
     var bootstrapError: Error?
     var stopError: Error?
@@ -122,9 +126,10 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
             return bootstrapOutput
         }
         operations.append("screenshot")
+        if exitsOnScreenshot { containers[name]?.running = false }
         if execFailuresRemaining > 0 {
             execFailuresRemaining -= 1
-            throw BotComputerGuestError.observeFailed
+            throw execFailure
         }
         if let execError { throw execError }
         if let output = execOutput?(command) { return output }
@@ -159,6 +164,11 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
         for name in containers.keys where name.hasPrefix(namePrefix) {
             try remove(name: name)
         }
+    }
+
+    func logs(name: String, tailLines: Int) throws -> String {
+        if let logError { throw logError }
+        return logText
     }
 }
 
@@ -1228,6 +1238,71 @@ final class BotComputerGuestServiceTests: XCTestCase {
         XCTAssertTrue(fake.containers.isEmpty)
         XCTAssertEqual(service.lastReady?.pngMagic, BotComputerGuestService.pngMagicHex)
         XCTAssertEqual(service.lastReady?.screenURL.host, "127.0.0.1")
+    }
+
+    func test_proveReadyWaitsBetweenDockerFailuresBeforeScreenBecomesReady() throws {
+        // A real failed `docker exec import` throws DockerError, not GuestError.
+        // Skipping this pause consumes the boot budget before Xvfb can start.
+        let support = makeSupport("rc-guest-docker-retry")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        fake.execFailuresRemaining = 2
+        fake.execFailure = BotComputerDockerError.provisioningFailed
+        let slept = SleepCounter()
+        let service = BotComputerGuestService(
+            appSupport: support, docker: fake, observeAttempts: 4, observeDelay: 0.5,
+            sleep: { delay in
+                XCTAssertEqual(delay, 0.5)
+                slept.count += 1
+            }
+        )
+        XCTAssertTrue(service.proveReady())
+        XCTAssertEqual(slept.count, 2)
+    }
+
+    func test_proveReadyWaitsBetweenDockerFailuresButNotAfterLastAttempt() throws {
+        let support = makeSupport("rc-guest-docker-exhausted")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        fake.execError = BotComputerDockerError.provisioningFailed
+        let slept = SleepCounter()
+        let service = BotComputerGuestService(
+            appSupport: support, docker: fake, observeAttempts: 3, observeDelay: 0.5,
+            sleep: { _ in slept.count += 1 }
+        )
+        XCTAssertFalse(service.proveReady())
+        XCTAssertNil(service.lastReady)
+        XCTAssertEqual(slept.count, 2)
+    }
+
+    func test_proveReadyReportsExitedContainerEvenWhenLogsAreUnavailable() throws {
+        let support = makeSupport("rc-guest-crashed")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        fake.execError = BotComputerDockerError.provisioningFailed
+        fake.exitsOnScreenshot = true
+        fake.logError = BotComputerDockerError.daemonUnavailable
+        let service = BotComputerGuestService(
+            appSupport: support, docker: fake, observeAttempts: 1, observeDelay: 0
+        )
+        XCTAssertFalse(service.proveReady())
+        XCTAssertTrue(service.lastReason.contains("container exited"), service.lastReason)
+        XCTAssertNil(service.lastReady)
+    }
+
+    func test_proveReadyIncludesBoundedCrashLogs() throws {
+        let support = makeSupport("rc-guest-crash-logs")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        fake.execError = BotComputerDockerError.provisioningFailed
+        fake.exitsOnScreenshot = true
+        fake.logText = String(repeating: "x", count: 8_192) + "\nXvfb failed to start"
+        let service = BotComputerGuestService(
+            appSupport: support, docker: fake, observeAttempts: 1, observeDelay: 0
+        )
+        XCTAssertFalse(service.proveReady())
+        XCTAssertTrue(service.lastReason.contains("Xvfb failed to start"))
+        XCTAssertLessThan(service.lastReason.count, 5_000)
     }
 
     func test_proveReadyScavengesLeftoverProbes() throws {
